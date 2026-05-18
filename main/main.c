@@ -102,7 +102,7 @@ static void touch_task(void *arg)
             s_tap_y       = y;
             s_tap_pending = true;
         }
-        vTaskDelay(pdMS_TO_TICKS(20)); /* 50 Hz */
+        vTaskDelay(pdMS_TO_TICKS(10)); /* 100 Hz */
     }
 }
 
