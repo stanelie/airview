@@ -91,7 +91,6 @@ static volatile bool  s_tap_pending = false;
 static volatile uint16_t s_tap_x   = 0;
 static volatile uint16_t s_tap_y   = 0;
 
-static volatile bool  s_postview_pending = false;
 
 static void touch_task(void *arg)
 {
@@ -293,34 +292,6 @@ static bool cam_set_prop(const char *name, const char *value)
 
 /* Download binary data (JPEG, XML) directly into a caller-supplied buffer.
    Returns number of bytes received, or 0 on error. */
-static int cam_get_binary(const char *path, uint8_t *buf, int buf_size)
-{
-    char url[256];
-    snprintf(url, sizeof(url), "http://%s%s", CAM_IP, path);
-    esp_http_client_config_t cfg = {
-        .url = url, .timeout_ms = 8000,
-    };
-    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    esp_http_client_set_header(c, "User-Agent", "OlympusCameraKit");
-    esp_http_client_set_header(c, "X-Protocol", "OlympusCameraKit");
-    int total = 0;
-    if (esp_http_client_open(c, 0) == ESP_OK) {
-        esp_http_client_fetch_headers(c);
-        int n;
-        while (total < buf_size - 1 &&
-               (n = esp_http_client_read(c, (char *)buf + total, buf_size - 1 - total)) > 0)
-            total += n;
-    } else {
-        ESP_LOGE(TAG, "cam_get_binary open failed: %s", path);
-    }
-    buf[total] = '\0';
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
-    xSemaphoreGive(s_http_mutex);
-    return total;
-}
-
 /* ── Field selection tables ───────────────────────────────────────────────── */
 
 #define ARRAY_SIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -1184,10 +1155,7 @@ static inline int32_t be32s(const uint8_t *p)
                    | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3]);
 }
 
-/* Per-func_id storage: func_ids seen go up to 115; store up to 3 words each. */
-#define EXT_MAX_FUNC 116
-static int32_t s_ext_prev[EXT_MAX_FUNC][3];
-static bool    s_ext_seen[EXT_MAX_FUNC];
+static bool s_ext_logged = false;
 
 static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
 {
@@ -1202,32 +1170,12 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
         int data_len = field_words * 4;
         if (p + data_len > end) break;
 
-        int32_t w0 = field_words >= 1 ? be32s(p)     : 0;
-        int32_t w1 = field_words >= 2 ? be32s(p + 4) : 0;
-        int32_t w2 = field_words >= 3 ? be32s(p + 8) : 0;
-
-        if (func_id < EXT_MAX_FUNC) {
-            if (!s_ext_seen[func_id]) {
-                /* First time we see this field — log its initial value. */
-                ESP_LOGI(TAG, "ext func=%u words=%u [0]=%ld [1]=%ld [2]=%ld",
-                         func_id, field_words, (long)w0, (long)w1, (long)w2);
-                s_ext_seen[func_id] = true;
-                s_ext_prev[func_id][0] = w0;
-                s_ext_prev[func_id][1] = w1;
-                s_ext_prev[func_id][2] = w2;
-            } else if (w0 != s_ext_prev[func_id][0] ||
-                       w1 != s_ext_prev[func_id][1] ||
-                       w2 != s_ext_prev[func_id][2]) {
-                /* Value changed — log it so we can identify the capture signal. */
-                ESP_LOGI(TAG, "ext CHANGED func=%u [0]=%ld→%ld [1]=%ld→%ld [2]=%ld→%ld",
-                         func_id,
-                         (long)s_ext_prev[func_id][0], (long)w0,
-                         (long)s_ext_prev[func_id][1], (long)w1,
-                         (long)s_ext_prev[func_id][2], (long)w2);
-                s_ext_prev[func_id][0] = w0;
-                s_ext_prev[func_id][1] = w1;
-                s_ext_prev[func_id][2] = w2;
-            }
+        if (!s_ext_logged) {
+            int32_t w0 = field_words >= 1 ? be32s(p)     : 0;
+            int32_t w1 = field_words >= 2 ? be32s(p + 4) : 0;
+            int32_t w2 = field_words >= 3 ? be32s(p + 8) : 0;
+            ESP_LOGI(TAG, "ext func=%u words=%u [0]=%ld [1]=%ld [2]=%ld",
+                     func_id, field_words, (long)w0, (long)w1, (long)w2);
         }
 
         switch (func_id) {
@@ -1254,6 +1202,7 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
         p += data_len;
     }
 
+    if (!s_ext_logged) s_ext_logged = true;
     s_osd.valid = true;
 }
 
@@ -1627,108 +1576,6 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
 /* Fetch the thumbnail of the last image on the camera and hold it on screen
    for one second.  Called from the liveview task; jpeg_buf (PSRAM) is reused
    as a scratch area for both the image-list XML and the thumbnail JPEG. */
-static void fetch_and_show_postview(uint8_t *jpeg_buf, uint16_t *fb)
-{
-    static uint8_t work[4096];
-    static char    last_shown_path[64] = {0};
-
-    s_postview_pending = false;
-    ESP_LOGI(TAG, "postview: fetch started");
-
-    /* Give the camera a moment to finish writing the file. */
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    /* Fetch the directory listing.  The camera uses /DCIM/100OLYMP/ by
-       convention; on error we log and bail out gracefully. */
-    int list_len = cam_get_binary("/get_imglist.cgi?DIR=/DCIM/100OLYMP/",
-                                  jpeg_buf, JPEG_BUF_SIZE);
-    ESP_LOGI(TAG, "postview: list_len=%d  raw=[%.*s]",
-             list_len, list_len > 512 ? 512 : list_len, (char *)jpeg_buf);
-    if (list_len <= 0) {
-        ESP_LOGW(TAG, "postview: image list empty");
-        return;
-    }
-
-    /* Scan forward through the XML for the last PATH="..." attribute. */
-    char *last_path = NULL;
-    char *p = (char *)jpeg_buf;
-    while ((p = strstr(p, "PATH=\"")) != NULL) {
-        last_path = p + 6;
-        p++;
-    }
-    if (!last_path) {
-        ESP_LOGW(TAG, "postview: no PATH in listing: %.*s", list_len > 256 ? 256 : list_len,
-                 (char *)jpeg_buf);
-        return;
-    }
-    char *quote_end = strchr(last_path, '"');
-    if (!quote_end) return;
-
-    char img_path[64];
-    int  path_len = (int)(quote_end - last_path);
-    if (path_len <= 0 || path_len >= (int)sizeof(img_path)) return;
-    memcpy(img_path, last_path, (size_t)path_len);
-    img_path[path_len] = '\0';
-
-    /* Skip if this is the same image we showed last time (false trigger guard). */
-    if (strcmp(img_path, last_shown_path) == 0) {
-        ESP_LOGI(TAG, "postview: no new image, skipping");
-        return;
-    }
-    strncpy(last_shown_path, img_path, sizeof(last_shown_path) - 1);
-    last_shown_path[sizeof(last_shown_path) - 1] = '\0';
-
-    /* Fetch the thumbnail JPEG (jpeg_buf is safe to reuse — img_path is copied). */
-    char thumb_path[96];
-    snprintf(thumb_path, sizeof(thumb_path), "/get_thumbnail.cgi?PATH=%s", img_path);
-    int jpeg_len = cam_get_binary(thumb_path, jpeg_buf, JPEG_BUF_SIZE);
-    if (jpeg_len < 100) {
-        ESP_LOGW(TAG, "postview: thumbnail too small (%d bytes) for %s", jpeg_len, img_path);
-        return;
-    }
-
-    ESP_LOGI(TAG, "postview: %s  %d bytes", img_path, jpeg_len);
-
-    /* Decode thumbnail into framebuffer (black background, scaled to fill width). */
-    jpeg_ctx_t ctx = {
-        .data  = jpeg_buf,
-        .len   = (size_t)jpeg_len,
-        .pos   = 0,
-        .fb    = fb,
-        .x_off = 0,
-        .y_off = 0,
-    };
-    JDEC jd;
-    if (jd_prepare(&jd, jpeg_infunc, work, sizeof(work), &ctx) != JDR_OK) {
-        ESP_LOGE(TAG, "postview: jd_prepare failed");
-        return;
-    }
-    ctx.src_w = jd.width;
-    ctx.src_h = jd.height;
-    ctx.dst_w = LCD_W;
-    ctx.dst_h = (int)jd.height * LCD_W / (int)jd.width;
-    ctx.y_off = (LCD_H - ctx.dst_h) / 2;
-
-    memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
-    if (jd_decomp(&jd, jpeg_outfunc, 0) != JDR_OK) {
-        ESP_LOGE(TAG, "postview: jd_decomp failed");
-        return;
-    }
-
-    const int STRIP_H = 40;
-    for (int y = 0; y < LCD_H; y += STRIP_H) {
-        int h = (y + STRIP_H <= LCD_H) ? STRIP_H : (LCD_H - y);
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_W, y + h, fb + y * LCD_W);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    /* Mark the ring-on-fb flag so the next liveview frame properly repaints
-       the letterbox areas (postview left them black, which is correct, but
-       the s_ring_on_fb guard in decode_and_display won't know to clear them). */
-    s_ring_on_fb = true;
-}
-
 /* ── Liveview loop ────────────────────────────────────────────────────────── */
 
 static void liveview_loop(uint8_t *jpeg_buf, uint16_t *fb)
@@ -1762,6 +1609,14 @@ restart:;
     snprintf(url, sizeof(url), "/exec_takemisc.cgi?com=startliveview&port=%d", LV_PORT);
     cam_get(url);
 
+    /* Start pushevent task here, after switch_cameramode + startliveview, so the
+       camera's event channel is not torn down by a subsequent mode switch. */
+    static bool s_pushevent_started = false;
+    if (!s_pushevent_started) {
+        s_pushevent_started = true;
+        xTaskCreate(pushevent_task, "pushevent", 4096, NULL, 4, NULL);
+    }
+
     uint32_t cur_frame  = 0;
     int      jpeg_off   = 0;
     bool     started    = false;
@@ -1774,7 +1629,6 @@ restart:;
         int n = recv(sock, pkt, sizeof(pkt), 0);
 
         if (n < 0) {
-            ESP_LOGI(TAG, "recv timeout #%d (frames=%" PRIu32 ")", timeouts + 1, frames);
             if (++timeouts >= 3) {
                 ESP_LOGW(TAG, "stream stalled — restarting");
                 if (!s_ring_on_fb) {
@@ -1797,13 +1651,6 @@ restart:;
            during capture, so this almost always means a picture was taken.
            Guard with frames > 10 so we don't trigger on the initial startup gap,
            and skip if another postview fetch is already queued. */
-        if (timeouts > 0) {
-            ESP_LOGI(TAG, "stream recovered after %d timeout(s), frames=%" PRIu32, timeouts, frames);
-            if (frames > 10 && !s_postview_pending) {
-                ESP_LOGI(TAG, "postview triggered");
-                s_postview_pending = true;
-            }
-        }
         timeouts = 0;
         if (n < 12) continue;
 
@@ -1908,8 +1755,6 @@ restart:;
             started  = false;
             jpeg_off = 0;
 
-            if (s_postview_pending)
-                fetch_and_show_postview(jpeg_buf, fb);
         }
     }
 
@@ -1934,8 +1779,6 @@ void app_main(void)
     wifi_init();
     cam_get("/get_connectmode.cgi");
     cam_get("/switch_cameramode.cgi?mode=rec");
-
-    xTaskCreate(pushevent_task, "pushevent", 4096, NULL, 4, NULL);
 
     /* Read current shooting mode from camera */
     char mode_val[8] = "P";
