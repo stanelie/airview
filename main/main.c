@@ -122,6 +122,9 @@ static int32_t s_af_color = 0;  /* 0=none, 1=succeeded(green), 2=failed(red) */
 static int32_t s_af_lv_x  = 0, s_af_lv_y = 0;
 static int32_t s_af_lv_w  = 0, s_af_lv_h = 0;
 
+typedef struct { int lv_x, lv_y; } af_req_t;
+static QueueHandle_t s_af_queue = NULL;
+
 
 static int s_selected_field = -1;   /* -1=none, 0=shutter, 1=aperture, 2=ISO, 3=exprev */
 
@@ -813,6 +816,22 @@ static void battery_task(void *arg)
         char bv[12] = {0};
         if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv)))
             set_battery_str(bv);
+    }
+}
+
+static void af_task(void *arg)
+{
+    af_req_t req;
+    for (;;) {
+        if (xQueueReceive(s_af_queue, &req, portMAX_DELAY) != pdTRUE) continue;
+        char url[80];
+        snprintf(url, sizeof(url),
+                 "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
+                 req.lv_x, req.lv_y);
+        ESP_LOGI(TAG, "touch AF → lv (%d,%d)", req.lv_x, req.lv_y);
+        cam_get(url);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        cam_get("/exec_takemotion.cgi?com=newstoptake");
     }
 }
 
@@ -1618,6 +1637,8 @@ restart:;
         s_pushevent_started = true;
         xTaskCreate(pushevent_task, "pushevent", 4096, NULL, 4, NULL);
         xTaskCreate(battery_task,   "battery",   4096, NULL, 3, NULL);
+        s_af_queue = xQueueCreate(1, sizeof(af_req_t));
+        xTaskCreate(af_task, "touch_af", 4096, NULL, 4, NULL);
     }
 
     uint32_t cur_frame   = 0;
@@ -1738,18 +1759,13 @@ restart:;
                     ESP_LOGI(TAG, "adjust field %d delta %d", s_selected_field, delta);
                     adjust_field(s_selected_field, delta);
                 } else {
-                    /* Tap on main image: touch AF at tapped point (focus only, shot cancelled) */
+                    /* Tap on main image: queue touch AF — the af_task handles
+                       the HTTP calls so the liveview loop keeps running. */
                     int lv_x, lv_y;
-                    if (tap_to_liveview(tx, ty, &lv_x, &lv_y)) {
+                    if (tap_to_liveview(tx, ty, &lv_x, &lv_y) && s_af_queue) {
                         s_af_color = 0;
-                        char url[80];
-                        snprintf(url, sizeof(url),
-                                 "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
-                                 lv_x, lv_y);
-                        ESP_LOGI(TAG, "touch AF → lv (%d,%d)", lv_x, lv_y);
-                        cam_get(url);
-                        vTaskDelay(pdMS_TO_TICKS(300));
-                        cam_get("/exec_takemotion.cgi?com=newstoptake");
+                        af_req_t req = { lv_x, lv_y };
+                        xQueueOverwrite(s_af_queue, &req);
                     }
                 }
             }
