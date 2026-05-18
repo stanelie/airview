@@ -92,7 +92,6 @@ static volatile uint16_t s_tap_x   = 0;
 static volatile uint16_t s_tap_y   = 0;
 
 static volatile bool  s_postview_pending = false;
-static char           s_recstate_prev[16] = "recstartable";
 
 static void touch_task(void *arg)
 {
@@ -829,14 +828,6 @@ static void refresh_prop(const char *prop_name)
     }
     else if (strcmp(prop_name, "BATTERY_LEVEL") == 0) {
         set_battery_str(val);
-    }
-    else if (strcmp(prop_name, "RECSTATE") == 0) {
-        bool was_busy  = strcmp(s_recstate_prev, "recstartable") != 0;
-        bool now_ready = strcmp(val, "recstartable") == 0;
-        if (was_busy && now_ready)
-            s_postview_pending = true;
-        strncpy(s_recstate_prev, val, sizeof(s_recstate_prev) - 1);
-        s_recstate_prev[sizeof(s_recstate_prev) - 1] = '\0';
     }
 
     s_osd.valid = true;
@@ -1617,6 +1608,7 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
 static void fetch_and_show_postview(uint8_t *jpeg_buf, uint16_t *fb)
 {
     static uint8_t work[4096];
+    static char    last_shown_path[64] = {0};
 
     s_postview_pending = false;
 
@@ -1652,6 +1644,14 @@ static void fetch_and_show_postview(uint8_t *jpeg_buf, uint16_t *fb)
     if (path_len <= 0 || path_len >= (int)sizeof(img_path)) return;
     memcpy(img_path, last_path, (size_t)path_len);
     img_path[path_len] = '\0';
+
+    /* Skip if this is the same image we showed last time (false trigger guard). */
+    if (strcmp(img_path, last_shown_path) == 0) {
+        ESP_LOGI(TAG, "postview: no new image, skipping");
+        return;
+    }
+    strncpy(last_shown_path, img_path, sizeof(last_shown_path) - 1);
+    last_shown_path[sizeof(last_shown_path) - 1] = '\0';
 
     /* Fetch the thumbnail JPEG (jpeg_buf is safe to reuse — img_path is copied). */
     char thumb_path[96];
@@ -1767,6 +1767,12 @@ restart:;
             }
             continue;
         }
+        /* Liveview recovered after a brief stall — the camera pauses the stream
+           during capture, so this almost always means a picture was taken.
+           Guard with frames > 10 so we don't trigger on the initial startup gap,
+           and skip if another postview fetch is already queued. */
+        if (timeouts > 0 && frames > 10 && !s_postview_pending)
+            s_postview_pending = true;
         timeouts = 0;
         if (n < 12) continue;
 
