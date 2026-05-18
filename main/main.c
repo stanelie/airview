@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "driver/ledc.h"
+#include "esp_timer.h"
 #include <stdlib.h>
 #include "freertos/semphr.h"
 
@@ -1622,6 +1623,7 @@ restart:;
     bool     started    = false;
     int      timeouts   = 0;
     uint32_t frames     = 0;
+    uint64_t batt_poll_us = 0;
 
     ESP_LOGI(TAG, "liveview started");
 
@@ -1752,6 +1754,17 @@ restart:;
             frames++;
             if (frames % 30 == 0)
                 ESP_LOGI(TAG, "%" PRIu32 " frames", frames);
+
+            /* Poll battery every 60 s — push events don't cover all transitions */
+            {
+                uint64_t now = esp_timer_get_time();
+                if (now - batt_poll_us >= 60000000ULL) {
+                    batt_poll_us = now;
+                    char bv[12] = {0};
+                    if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv)))
+                        set_battery_str(bv);
+                }
+            }
             started  = false;
             jpeg_off = 0;
 
