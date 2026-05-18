@@ -1184,7 +1184,10 @@ static inline int32_t be32s(const uint8_t *p)
                    | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3]);
 }
 
-static bool s_ext_logged = false;
+/* Per-func_id storage: func_ids seen go up to 115; store up to 3 words each. */
+#define EXT_MAX_FUNC 116
+static int32_t s_ext_prev[EXT_MAX_FUNC][3];
+static bool    s_ext_seen[EXT_MAX_FUNC];
 
 static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
 {
@@ -1199,12 +1202,32 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
         int data_len = field_words * 4;
         if (p + data_len > end) break;
 
-        if (!s_ext_logged) {
-            int32_t w0 = field_words >= 1 ? be32s(p)     : 0;
-            int32_t w1 = field_words >= 2 ? be32s(p + 4) : 0;
-            int32_t w2 = field_words >= 3 ? be32s(p + 8) : 0;
-            ESP_LOGI(TAG, "ext func=%u words=%u [0]=%ld [1]=%ld [2]=%ld",
-                     func_id, field_words, (long)w0, (long)w1, (long)w2);
+        int32_t w0 = field_words >= 1 ? be32s(p)     : 0;
+        int32_t w1 = field_words >= 2 ? be32s(p + 4) : 0;
+        int32_t w2 = field_words >= 3 ? be32s(p + 8) : 0;
+
+        if (func_id < EXT_MAX_FUNC) {
+            if (!s_ext_seen[func_id]) {
+                /* First time we see this field — log its initial value. */
+                ESP_LOGI(TAG, "ext func=%u words=%u [0]=%ld [1]=%ld [2]=%ld",
+                         func_id, field_words, (long)w0, (long)w1, (long)w2);
+                s_ext_seen[func_id] = true;
+                s_ext_prev[func_id][0] = w0;
+                s_ext_prev[func_id][1] = w1;
+                s_ext_prev[func_id][2] = w2;
+            } else if (w0 != s_ext_prev[func_id][0] ||
+                       w1 != s_ext_prev[func_id][1] ||
+                       w2 != s_ext_prev[func_id][2]) {
+                /* Value changed — log it so we can identify the capture signal. */
+                ESP_LOGI(TAG, "ext CHANGED func=%u [0]=%ld→%ld [1]=%ld→%ld [2]=%ld→%ld",
+                         func_id,
+                         (long)s_ext_prev[func_id][0], (long)w0,
+                         (long)s_ext_prev[func_id][1], (long)w1,
+                         (long)s_ext_prev[func_id][2], (long)w2);
+                s_ext_prev[func_id][0] = w0;
+                s_ext_prev[func_id][1] = w1;
+                s_ext_prev[func_id][2] = w2;
+            }
         }
 
         switch (func_id) {
@@ -1231,7 +1254,6 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
         p += data_len;
     }
 
-    if (!s_ext_logged) s_ext_logged = true;
     s_osd.valid = true;
 }
 
@@ -1611,6 +1633,7 @@ static void fetch_and_show_postview(uint8_t *jpeg_buf, uint16_t *fb)
     static char    last_shown_path[64] = {0};
 
     s_postview_pending = false;
+    ESP_LOGI(TAG, "postview: fetch started");
 
     /* Give the camera a moment to finish writing the file. */
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -1619,6 +1642,8 @@ static void fetch_and_show_postview(uint8_t *jpeg_buf, uint16_t *fb)
        convention; on error we log and bail out gracefully. */
     int list_len = cam_get_binary("/get_imglist.cgi?DIR=/DCIM/100OLYMP/",
                                   jpeg_buf, JPEG_BUF_SIZE);
+    ESP_LOGI(TAG, "postview: list_len=%d  raw=[%.*s]",
+             list_len, list_len > 512 ? 512 : list_len, (char *)jpeg_buf);
     if (list_len <= 0) {
         ESP_LOGW(TAG, "postview: image list empty");
         return;
@@ -1749,6 +1774,7 @@ restart:;
         int n = recv(sock, pkt, sizeof(pkt), 0);
 
         if (n < 0) {
+            ESP_LOGI(TAG, "recv timeout #%d (frames=%" PRIu32 ")", timeouts + 1, frames);
             if (++timeouts >= 3) {
                 ESP_LOGW(TAG, "stream stalled — restarting");
                 if (!s_ring_on_fb) {
@@ -1771,8 +1797,13 @@ restart:;
            during capture, so this almost always means a picture was taken.
            Guard with frames > 10 so we don't trigger on the initial startup gap,
            and skip if another postview fetch is already queued. */
-        if (timeouts > 0 && frames > 10 && !s_postview_pending)
-            s_postview_pending = true;
+        if (timeouts > 0) {
+            ESP_LOGI(TAG, "stream recovered after %d timeout(s), frames=%" PRIu32, timeouts, frames);
+            if (frames > 10 && !s_postview_pending) {
+                ESP_LOGI(TAG, "postview triggered");
+                s_postview_pending = true;
+            }
+        }
         timeouts = 0;
         if (n < 12) continue;
 
