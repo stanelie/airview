@@ -806,6 +806,16 @@ static void refresh_prop(const char *prop_name)
     ESP_LOGI(TAG, "prop refreshed: %s = %s", prop_name, val);
 }
 
+static void battery_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+        char bv[12] = {0};
+        if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv)))
+            set_battery_str(bv);
+    }
+}
+
 static void pushevent_task(void *arg)
 {
     char path[64];
@@ -934,7 +944,7 @@ static void display_init(void)
         .data5_io_num    = -1,
         .data6_io_num    = -1,
         .data7_io_num    = -1,
-        .max_transfer_sz = LCD_W * 40 * sizeof(uint16_t),
+        .max_transfer_sz = LCD_W * 80 * sizeof(uint16_t),
         .flags           = SPICOMMON_BUSFLAG_MASTER,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
@@ -1103,6 +1113,11 @@ typedef struct {
     int            dst_h;
 } jpeg_ctx_t;
 
+/* Precomputed source→destination coordinate boundaries, filled once per frame
+   in decode_and_display and consumed by jpeg_outfunc. Sized for up to 640×480. */
+static int s_xmap[642];
+static int s_ymap[482];
+
 static size_t jpeg_infunc(JDEC *jd, uint8_t *buf, size_t ndata)
 {
     jpeg_ctx_t *ctx = (jpeg_ctx_t *)jd->device;
@@ -1120,28 +1135,17 @@ static int jpeg_outfunc(JDEC *jd, void *bitmap, JRECT *rect)
     int blk_w = rect->right  - rect->left + 1;
     int blk_h = rect->bottom - rect->top  + 1;
 
-    /* Precompute destination pixel boundaries for this MCU block.
-       Ceiling division ensures every destination pixel is covered for
-       both upscaling and downscaling: x_own = [xd[col], xd[col+1]). */
-    int xd[17], yd[17];
-    for (int i = 0; i <= blk_w; i++) {
-        int sx  = rect->left + i;
-        xd[i] = ctx->x_off + (sx * ctx->dst_w + ctx->src_w - 1) / ctx->src_w;
-    }
-    for (int i = 0; i <= blk_h; i++) {
-        int sy  = rect->top + i;
-        yd[i] = ctx->y_off + (sy * ctx->dst_h + ctx->src_h - 1) / ctx->src_h;
-    }
-
     for (int row = 0; row < blk_h; row++) {
+        int y0 = s_ymap[rect->top  + row];
+        int y1 = s_ymap[rect->top  + row + 1];
         for (int col = 0; col < blk_w; col++) {
             uint16_t px = __builtin_bswap16(*pix++);
-            for (int dy = yd[row]; dy < yd[row + 1]; dy++) {
-                if (dy < 0 || dy >= LCD_H) continue;
-                for (int dx = xd[col]; dx < xd[col + 1]; dx++) {
-                    if (dx >= 0 && dx < LCD_W)
-                        ctx->fb[dy * LCD_W + dx] = px;
-                }
+            int x0 = s_xmap[rect->left + col];
+            int x1 = s_xmap[rect->left + col + 1];
+            for (int dy = y0; dy < y1; dy++) {
+                uint16_t *row_ptr = ctx->fb + dy * LCD_W;
+                for (int dx = x0; dx < x1; dx++)
+                    row_ptr[dx] = px;
             }
         }
     }
@@ -1328,21 +1332,6 @@ static void draw_osd_bottom(uint16_t *fb)
     }
 }
 
-/* ── Drawing helpers ──────────────────────────────────────────────────────── */
-
-static void draw_circle(uint16_t *fb, int cx, int cy, int r, uint16_t color)
-{
-    int x = 0, y = r, d = 1 - r;
-    while (x <= y) {
-        int px[8] = {cx+x, cx-x, cx+x, cx-x, cx+y, cx-y, cx+y, cx-y};
-        int py[8] = {cy+y, cy+y, cy-y, cy-y, cy+x, cy+x, cy-x, cy-x};
-        for (int i = 0; i < 8; i++)
-            if ((unsigned)px[i] < (unsigned)LCD_W && (unsigned)py[i] < (unsigned)LCD_H)
-                fb[py[i] * LCD_W + px[i]] = color;
-        if (d < 0) d += 2 * x + 3; else { d += 2 * (x - y) + 5; y--; }
-        x++;
-    }
-}
 
 static void fill_outside_circle(uint16_t *fb, uint16_t color)
 {
@@ -1421,7 +1410,7 @@ static void liveview_to_display_rect(int lv_x, int lv_y, int lv_w, int lv_h,
 
 static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t *fb)
 {
-    static uint8_t work[4096];
+    static uint8_t work[16384];
 
     jpeg_ctx_t ctx = {
         .data  = jpeg_data,
@@ -1450,6 +1439,18 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         ctx.x_off = (LCD_W - (int)jd.width) / 2;
     }
     ctx.y_off = (LCD_H - ctx.dst_h) / 2;
+
+    /* Build source→destination coordinate tables once per frame (ceiling division
+       maps each source boundary to the destination boundary it covers). Values are
+       clamped to [0, LCD_W/H] so jpeg_outfunc needs no per-pixel bounds checks. */
+    for (int i = 0; i <= ctx.src_w; i++) {
+        int x = ctx.x_off + (i * ctx.dst_w + ctx.src_w - 1) / ctx.src_w;
+        s_xmap[i] = (x < 0) ? 0 : (x > LCD_W) ? LCD_W : x;
+    }
+    for (int j = 0; j <= ctx.src_h; j++) {
+        int y = ctx.y_off + (j * ctx.dst_h + ctx.src_h - 1) / ctx.src_h;
+        s_ymap[j] = (y < 0) ? 0 : (y > LCD_H) ? LCD_H : y;
+    }
 
     /* Clear letterbox rows if ring was drawn there and WiFi just came back */
     if (s_ring_on_fb) {
@@ -1565,7 +1566,7 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         s_ring_on_fb = true;
     }
 
-    const int STRIP_H = 40;
+    const int STRIP_H = 80;
     for (int y = 0; y < LCD_H; y += STRIP_H) {
         int h = (y + STRIP_H <= LCD_H) ? STRIP_H : (LCD_H - y);
         esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_W, y + h, fb + y * LCD_W);
@@ -1616,14 +1617,16 @@ restart:;
     if (!s_pushevent_started) {
         s_pushevent_started = true;
         xTaskCreate(pushevent_task, "pushevent", 4096, NULL, 4, NULL);
+        xTaskCreate(battery_task,   "battery",   4096, NULL, 3, NULL);
     }
 
-    uint32_t cur_frame  = 0;
-    int      jpeg_off   = 0;
-    bool     started    = false;
-    int      timeouts   = 0;
-    uint32_t frames     = 0;
-    uint64_t batt_poll_us = 0;
+    uint32_t cur_frame   = 0;
+    int      jpeg_off    = 0;
+    bool     started     = false;
+    int      timeouts    = 0;
+    uint32_t frames      = 0;
+    uint32_t fps_frames  = 0;
+    uint64_t fps_last_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "liveview started");
 
@@ -1752,21 +1755,33 @@ restart:;
             }
             decode_and_display(jpeg_buf, jpeg_off, fb);
             frames++;
-            if (frames % 30 == 0)
-                ESP_LOGI(TAG, "%" PRIu32 " frames", frames);
+            fps_frames++;
 
-            /* Poll battery every 60 s — push events don't cover all transitions */
+            /* Log FPS every 5 s */
             {
                 uint64_t now = esp_timer_get_time();
-                if (now - batt_poll_us >= 60000000ULL) {
-                    batt_poll_us = now;
-                    char bv[12] = {0};
-                    if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv)))
-                        set_battery_str(bv);
+                uint64_t elapsed = now - fps_last_us;
+                if (elapsed >= 5000000ULL) {
+                    float fps = fps_frames * 1000000.0f / elapsed;
+                    ESP_LOGI(TAG, "%.1f fps", fps);
+                    fps_frames  = 0;
+                    fps_last_us = now;
                 }
             }
+
             started  = false;
             jpeg_off = 0;
+
+            /* Drain any backlogged frames to keep latency low. Without
+               this, RECVMBOX=64 lets seconds of frames queue up. The cost
+               is ~1-2 fps when decode time ≈ frame period, but a viewfinder
+               with no lag beats one with 12fps and a second of delay. */
+            {
+                int fl = fcntl(sock, F_GETFL, 0);
+                fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+                while (recv(sock, pkt, sizeof(pkt), 0) > 0) {}
+                fcntl(sock, F_SETFL, fl);
+            }
 
         }
     }
