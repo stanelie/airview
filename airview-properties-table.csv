@@ -1,0 +1,6 @@
+mode,speed,aperture,exposition compensation,iso,wb
+P,,,yes,yes,yes
+A,,yes,yes,yes,yes
+S,yes,,yes,yes,yes
+M,yes,yes,,yes,yes
+iA,,,,,

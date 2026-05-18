@@ -1,0 +1,15 @@
+# ESP-IDF build output
+build/
+
+# Claude Code local settings
+.claude/
+
+# Vendor datasheets and PDFs
+*.pdf
+
+# macOS
+.DS_Store
+
+# VS Code / IDE
+.vscode/
+*.code-workspace

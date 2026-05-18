@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "i2c/i2c_driver.c"
+        "exio/tca9554.c"
+        "lcd/esp_lcd_spd2010.c"
+        "tjpgd/tjpgd.c"
+        "touch/spd2010_touch.c"
+    INCLUDE_DIRS
+        "."
+        "i2c"
+        "exio"
+        "lcd"
+        "tjpgd"
+        "touch"
+)
