@@ -287,6 +287,26 @@ static int cam_get_impl(const char *path)
     return status;
 }
 
+/* Fire a GET on an already-open client handle (no throttle, no init/cleanup).
+   Caller must hold s_http_mutex. Used to batch sequential requests on one TCP
+   connection so the inter-request throttle is not paid for each call. */
+static int cam_get_on(esp_http_client_handle_t c, const char *path)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s%s", CAM_IP, path);
+    s_resp[0] = '\0';
+    esp_http_client_set_url(c, url);
+    esp_err_t err = esp_http_client_perform(c);
+    int status = 0;
+    if (err == ESP_OK) {
+        status = esp_http_client_get_status_code(c);
+        ESP_LOGI(TAG, "GET %s  →  %d", path, status);
+    } else {
+        ESP_LOGE(TAG, "GET %s failed: %s", path, esp_err_to_name(err));
+    }
+    return status;
+}
+
 static int cam_get(const char *path)
 {
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
@@ -1721,12 +1741,32 @@ restart:;
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    cam_get("/switch_cameramode.cgi?mode=rec");
-    cam_get("/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
+    /* Issue the three startup commands on one persistent TCP connection.
+       A fresh TCP handshake per call plus the 150 ms inter-call throttle would
+       add ~300 ms; keep-alive collapses that to a single handshake + no gaps. */
+    {
+        char lv_url[64];
+        snprintf(lv_url, sizeof(lv_url),
+                 "/exec_takemisc.cgi?com=startliveview&port=%d", LV_PORT);
 
-    char url[64];
-    snprintf(url, sizeof(url), "/exec_takemisc.cgi?com=startliveview&port=%d", LV_PORT);
-    cam_get(url);
+        esp_http_client_config_t kcfg = {
+            .url               = "http://" CAM_IP "/",
+            .event_handler     = http_evt,
+            .timeout_ms        = 2000,
+            .keep_alive_enable = true,
+        };
+        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+        http_throttle();
+        esp_http_client_handle_t kc = esp_http_client_init(&kcfg);
+        esp_http_client_set_header(kc, "User-Agent", "OlympusCameraKit");
+        esp_http_client_set_header(kc, "X-Protocol",  "OlympusCameraKit");
+        cam_get_on(kc, "/switch_cameramode.cgi?mode=rec");
+        cam_get_on(kc, "/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
+        cam_get_on(kc, lv_url);
+        esp_http_client_cleanup(kc);
+        s_http_last_us = esp_timer_get_time();
+        xSemaphoreGive(s_http_mutex);
+    }
 
     /* Start pushevent task here, after switch_cameramode + startliveview, so the
        camera's event channel is not torn down by a subsequent mode switch. */
@@ -1922,6 +1962,13 @@ void app_main(void)
     touch_init();
     xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
     display_splash();
+
+    /* The PSRAM memtest removal saved ~320 ms, which caused WiFi to start
+       ~320 ms earlier than before. The camera's AP needs ~1100 ms from
+       ESP32 power-on to be ready for a WPA2 handshake; connecting earlier
+       causes a reliable first-attempt handshake timeout (reason 201) and a
+       full retry, costing ~3 extra seconds. This delay restores the window. */
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     wifi_init();
 
