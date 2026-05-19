@@ -163,6 +163,33 @@ static void channel_cache_save(uint8_t ch)
     }
 }
 
+/* ── WiFi credential NVS storage ─────────────────────────────────────────── */
+
+static void wifi_creds_load(char *ssid, char *pass)
+{
+    strncpy(ssid, WIFI_SSID, 32); ssid[32] = '\0';
+    strncpy(pass, WIFI_PASS, 64); pass[64] = '\0';
+    nvs_handle_t h;
+    if (nvs_open("airview", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = 33;
+        nvs_get_str(h, "wifi_ssid", ssid, &len);
+        len = 65;
+        nvs_get_str(h, "wifi_pass", pass, &len);
+        nvs_close(h);
+    }
+}
+
+static void wifi_creds_save(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "wifi_ssid", ssid);
+        nvs_set_str(h, "wifi_pass", pass);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* ── WiFi ─────────────────────────────────────────────────────────────────── */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -188,45 +215,66 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
 }
 
-static void wifi_init(void)
+static void wifi_driver_init(void)
 {
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     /* RAM-only storage: no NVS read/write during WPA2 handshake.
        NVS flash I/O on first connect races the EAPOL handler and stalls
        the 4-way handshake until the camera's 10 s timeout evicts us. */
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* Full WiFi init + connect start, NON-BLOCKING.
+   Registers event handlers before esp_wifi_start() so the STA_START event
+   triggers esp_wifi_connect() automatically — no extra delay to first connect.
+   Caller waits for WIFI_CONNECTED_BIT in s_wifi_events when it's ready to block. */
+static void wifi_begin_connecting(void)
+{
+    s_wifi_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    /* RAM-only storage avoids NVS flash I/O racing the EAPOL handler. */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    /* Register handlers BEFORE start so STA_START → esp_wifi_connect() fires
+       without any extra round-trip through app_main. */
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                wifi_event_handler, NULL));
 
+    char ssid[33], pass[65];
+    wifi_creds_load(ssid, pass);
     uint8_t cached_ch = channel_cache_load();
-    if (cached_ch) {
-        ESP_LOGI(TAG, "trying cached wifi channel %u first", cached_ch);
-    }
+    if (cached_ch)
+        ESP_LOGI(TAG, "trying cached channel %u first", cached_ch);
+
     wifi_config_t wifi_cfg = {
         .sta = {
-            .ssid           = WIFI_SSID,
-            .password       = WIFI_PASS,
-            .scan_method    = WIFI_FAST_SCAN,
-            .channel        = cached_ch,   /* 0 = scan all; non-zero = try this first */
+            .scan_method        = WIFI_FAST_SCAN,
+            .channel            = cached_ch,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
+    strncpy((char *)wifi_cfg.sta.ssid,     ssid, sizeof(wifi_cfg.sta.ssid));
+    strncpy((char *)wifi_cfg.sta.password, pass, sizeof(wifi_cfg.sta.password));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    /* Disable power save — avoids beacon-miss disconnects with the camera's AP */
     esp_wifi_set_ps(WIFI_PS_NONE);
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "connecting to %s...", WIFI_SSID);
-    xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    /* STA_START fires → wifi_event_handler calls esp_wifi_connect(). */
+    ESP_LOGI(TAG, "connecting to %s (non-blocking)...", ssid);
 }
 
 /* ── HTTP helper ──────────────────────────────────────────────────────────── */
@@ -1136,30 +1184,65 @@ static const uint8_t s_font8x8[96][8] = {
     ['n'  - 0x20] = {0x00,0x00,0x1E,0x12,0x12,0x12,0x12,0x00},
     ['o'  - 0x20] = {0x00,0x00,0x1E,0x12,0x12,0x12,0x1E,0x00},
     ['t'  - 0x20] = {0x02,0x02,0x1E,0x02,0x02,0x02,0x1C,0x00},
+    /* Uppercase additions */
+    ['J'  - 0x20] = {0x18,0x10,0x10,0x10,0x11,0x11,0x0E,0x00},
+    ['K'  - 0x20] = {0x11,0x09,0x05,0x03,0x05,0x09,0x11,0x00},
+    ['Q'  - 0x20] = {0x0E,0x11,0x11,0x11,0x15,0x09,0x1E,0x00},
+    ['V'  - 0x20] = {0x11,0x11,0x11,0x0A,0x0A,0x04,0x00,0x00},
+    ['X'  - 0x20] = {0x11,0x0A,0x04,0x04,0x0A,0x11,0x00,0x00},
+    ['Y'  - 0x20] = {0x11,0x0A,0x04,0x04,0x04,0x04,0x00,0x00},
+    ['Z'  - 0x20] = {0x1F,0x10,0x08,0x04,0x02,0x01,0x1F,0x00},
+    /* Lowercase additions (x-height: pixels 1-4; ascenders: pixels 0-4) */
+    ['a'  - 0x20] = {0x00,0x0E,0x10,0x1E,0x12,0x1E,0x00,0x00},
+    ['b'  - 0x20] = {0x02,0x02,0x1E,0x12,0x12,0x1E,0x00,0x00},
+    ['d'  - 0x20] = {0x10,0x10,0x1E,0x12,0x12,0x1E,0x00,0x00},
+    ['f'  - 0x20] = {0x1C,0x02,0x0E,0x02,0x02,0x02,0x00,0x00},
+    ['h'  - 0x20] = {0x02,0x02,0x1E,0x12,0x12,0x12,0x00,0x00},
+    ['j'  - 0x20] = {0x08,0x00,0x08,0x08,0x08,0x0A,0x04,0x00},
+    ['k'  - 0x20] = {0x02,0x02,0x12,0x0A,0x06,0x0A,0x12,0x00},
+    ['l'  - 0x20] = {0x06,0x02,0x02,0x02,0x02,0x0E,0x00,0x00},
+    ['m'  - 0x20] = {0x00,0x00,0x1B,0x15,0x15,0x15,0x00,0x00},
+    ['p'  - 0x20] = {0x00,0x1E,0x12,0x12,0x1E,0x02,0x02,0x00},
+    ['q'  - 0x20] = {0x00,0x1E,0x12,0x12,0x1E,0x10,0x10,0x00},
+    ['r'  - 0x20] = {0x00,0x00,0x1E,0x02,0x02,0x02,0x00,0x00},
+    ['s'  - 0x20] = {0x00,0x1E,0x02,0x0E,0x10,0x1E,0x00,0x00},
+    ['u'  - 0x20] = {0x00,0x00,0x12,0x12,0x12,0x1E,0x00,0x00},
+    ['v'  - 0x20] = {0x00,0x00,0x12,0x0A,0x0A,0x04,0x00,0x00},
+    ['w'  - 0x20] = {0x00,0x00,0x11,0x15,0x0A,0x0A,0x00,0x00},
+    ['x'  - 0x20] = {0x00,0x00,0x12,0x0C,0x0C,0x12,0x00,0x00},
+    ['y'  - 0x20] = {0x00,0x11,0x0A,0x04,0x04,0x04,0x00,0x00},
+    ['z'  - 0x20] = {0x00,0x00,0x1E,0x08,0x04,0x02,0x1E,0x00},
+    /* Symbols */
+    ['!'  - 0x20] = {0x04,0x04,0x04,0x04,0x04,0x00,0x04,0x00},
+    ['#'  - 0x20] = {0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A,0x00},
+    ['$'  - 0x20] = {0x04,0x0E,0x05,0x0E,0x14,0x0E,0x04,0x00},
+    ['&'  - 0x20] = {0x06,0x09,0x05,0x16,0x09,0x11,0x1E,0x00},
+    ['('  - 0x20] = {0x08,0x04,0x02,0x02,0x02,0x04,0x08,0x00},
+    [')'  - 0x20] = {0x02,0x04,0x08,0x08,0x08,0x04,0x02,0x00},
+    ['*'  - 0x20] = {0x00,0x04,0x15,0x0E,0x15,0x04,0x00,0x00},
+    [','  - 0x20] = {0x00,0x00,0x00,0x00,0x00,0x06,0x04,0x00},
+    [':'  - 0x20] = {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00,0x00},
+    [';'  - 0x20] = {0x00,0x06,0x06,0x00,0x06,0x04,0x02,0x00},
+    ['<'  - 0x20] = {0x08,0x04,0x02,0x01,0x02,0x04,0x08,0x00},
+    ['='  - 0x20] = {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00,0x00},
+    ['>'  - 0x20] = {0x01,0x02,0x04,0x08,0x04,0x02,0x01,0x00},
+    ['?'  - 0x20] = {0x0E,0x11,0x10,0x08,0x04,0x00,0x04,0x00},
+    ['@'  - 0x20] = {0x0E,0x11,0x1D,0x15,0x1D,0x01,0x0E,0x00},
+    ['['  - 0x20] = {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E,0x00},
+    [']'  - 0x20] = {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E,0x00},
+    ['^'  - 0x20] = {0x04,0x0A,0x11,0x00,0x00,0x00,0x00,0x00},
+    ['_'  - 0x20] = {0x00,0x00,0x00,0x00,0x00,0x00,0x1F,0x00},
 };
 
-static void display_splash(void)
+/* Draw text into fb at pixel (x0,y0) with given scale and color.
+   Simple version: no background/outline, just pixels. */
+static void splash_draw_text(uint16_t *fb, int x0, int y0, int scale,
+                              const char *text, uint16_t color)
 {
-    /* Render into a PSRAM framebuffer then send in 40-row strips — same path
-       as the liveview loop, avoiding the D-cache coherency issue that occurs
-       when sending many small internal-SRAM strips via DMA. */
-    uint16_t *fb = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t),
-                                    MALLOC_CAP_SPIRAM);
-    if (!fb) return;
-    memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
-
-    const char *text  = "Connecting...";
-    const int   scale = 2;
-    const int   cw    = 8 * scale;
-    const int   ch    = 8 * scale;
-    const int   gap   = 1 * scale;
-    int text_len = (int)strlen(text);
-    int text_w   = text_len * cw + (text_len - 1) * gap;
-    int text_x   = (LCD_W - text_w) / 2;
-    int text_y   = (LCD_H - ch)    / 2;
-
-    int cx = text_x;
-    for (int i = 0; i < text_len; i++) {
+    const int cw  = 8 * scale;
+    const int gap = scale;
+    int cx = x0;
+    for (int i = 0; text[i]; i++) {
         uint8_t c = (uint8_t)text[i];
         if (c >= 0x20 && c < 0x80) {
             for (int fr = 0; fr < 8; fr++) {
@@ -1167,12 +1250,12 @@ static void display_splash(void)
                 for (int fc = 0; fc < 8; fc++) {
                     if (!(bits & (1u << fc))) continue;
                     for (int sy = 0; sy < scale; sy++) {
-                        int py = text_y + fr * scale + sy;
+                        int py = y0 + fr * scale + sy;
                         if (py < 0 || py >= LCD_H) continue;
                         for (int sx = 0; sx < scale; sx++) {
                             int px = cx + fc * scale + sx;
                             if (px >= 0 && px < LCD_W)
-                                fb[py * LCD_W + px] = 0xFFFF;
+                                fb[py * LCD_W + px] = color;
                         }
                     }
                 }
@@ -1180,13 +1263,75 @@ static void display_splash(void)
         }
         cx += cw + gap;
     }
+}
 
+static void splash_flush(uint16_t *fb)
+{
     const int STRIP_H = 40;
     for (int y = 0; y < LCD_H; y += STRIP_H) {
         int h = (y + STRIP_H <= LCD_H) ? STRIP_H : (LCD_H - y);
         esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_W, y + h, fb + y * LCD_W);
     }
+}
 
+/* Draw a bordered button rectangle. */
+static void splash_draw_button(uint16_t *fb, int bx, int by, int bw, int bh,
+                                const char *label, uint16_t border, uint16_t fill)
+{
+    /* Fill */
+    for (int row = by; row < by + bh; row++)
+        for (int col = bx; col < bx + bw; col++)
+            if (row >= 0 && row < LCD_H && col >= 0 && col < LCD_W)
+                fb[row * LCD_W + col] = fill;
+    /* 2 px border */
+    for (int t = 0; t < 2; t++) {
+        for (int col = bx - t; col <= bx + bw + t; col++) {
+            if (col < 0 || col >= LCD_W) continue;
+            int r0 = by - t, r1 = by + bh + t;
+            if (r0 >= 0 && r0 < LCD_H) fb[r0 * LCD_W + col] = border;
+            if (r1 >= 0 && r1 < LCD_H) fb[r1 * LCD_W + col] = border;
+        }
+        for (int row = by - t; row <= by + bh + t; row++) {
+            if (row < 0 || row >= LCD_H) continue;
+            int c0 = bx - t, c1 = bx + bw + t;
+            if (c0 >= 0 && c0 < LCD_W) fb[row * LCD_W + c0] = border;
+            if (c1 >= 0 && c1 < LCD_W) fb[row * LCD_W + c1] = border;
+        }
+    }
+    /* Centered label */
+    if (label) {
+        const int scale = 2;
+        const int cw = 8 * scale, gap = scale;
+        int len = (int)strlen(label);
+        int tw = len * cw + (len > 1 ? (len - 1) * gap : 0);
+        int tx = bx + (bw - tw) / 2;
+        int ty = by + (bh - 8 * scale) / 2;
+        splash_draw_text(fb, tx, ty, scale, label, border);
+    }
+}
+
+/* Render the "Connecting..." screen with the WiFi Setup button and push it to
+   the LCD.  Pure render — no blocking, no touch polling.  The caller runs the
+   poll loop so the WiFi connection can proceed in parallel. */
+static void display_splash(void)
+{
+    uint16_t *fb = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t),
+                                    MALLOC_CAP_SPIRAM);
+    if (!fb) return;
+    memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+
+    const char *text  = "Connecting...";
+    const int   scale = 2, cw = 8 * scale, gap = scale;
+    int len    = (int)strlen(text);
+    int text_w = len * cw + (len - 1) * gap;
+    splash_draw_text(fb, (LCD_W - text_w) / 2, LCD_H / 2 - cw - 30,
+                     scale, text, 0xFFFF);
+
+    const uint16_t green = __builtin_bswap16(0x07E0);
+    splash_draw_button(fb, (LCD_W - 160) / 2, LCD_H / 2 + 20, 160, 44,
+                       "WiFi Setup", green, 0x0000);
+
+    splash_flush(fb);
     heap_caps_free(fb);
 }
 
@@ -1950,6 +2095,413 @@ restart:;
     close(sock);
 }
 
+/* ── WiFi Setup UI ────────────────────────────────────────────────────────── */
+
+/* Text width in pixels for given string, scale, and per-char gap. */
+static int ui_text_w(const char *s, int scale)
+{
+    int len = (int)strlen(s);
+    return len * 8 * scale + (len > 1 ? (len - 1) * scale : 0);
+}
+
+/* Fill a rectangle in PSRAM fb. */
+static void ui_fill(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
+{
+    for (int row = y; row < y + h; row++) {
+        if (row < 0 || row >= LCD_H) continue;
+        for (int col = x; col < x + w; col++)
+            if (col >= 0 && col < LCD_W)
+                fb[row * LCD_W + col] = color;
+    }
+}
+
+static void ui_flush(uint16_t *fb)
+{
+    const int SH = 40;
+    for (int y = 0; y < LCD_H; y += SH) {
+        int h = (y + SH <= LCD_H) ? SH : (LCD_H - y);
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_W, y + h, fb + y * LCD_W);
+    }
+}
+
+/* Draw text centered horizontally in a box (box_x, box_w) at row ty. */
+static void ui_text_center(uint16_t *fb, int box_x, int box_w, int ty,
+                            int scale, const char *s, uint16_t color)
+{
+    int tw = ui_text_w(s, scale);
+    splash_draw_text(fb, box_x + (box_w - tw) / 2, ty, scale, s, color);
+}
+
+/* Draw a bordered button and return true if the last tap fell within it. */
+static void ui_button(uint16_t *fb, int x, int y, int w, int h,
+                       const char *label, int lscale, uint16_t border, uint16_t fill)
+{
+    ui_fill(fb, x, y, w, h, fill);
+    /* 2 px border */
+    for (int t = 0; t < 2; t++) {
+        for (int col = x - t; col <= x + w + t; col++) {
+            if (col < 0 || col >= LCD_W) continue;
+            if (y - t >= 0)       fb[(y - t)       * LCD_W + col] = border;
+            if (y + h + t < LCD_H) fb[(y + h + t)  * LCD_W + col] = border;
+        }
+        for (int row = y - t; row <= y + h + t; row++) {
+            if (row < 0 || row >= LCD_H) continue;
+            if (x - t >= 0)       fb[row * LCD_W + (x - t)]       = border;
+            if (x + w + t < LCD_W) fb[row * LCD_W + (x + w + t)]  = border;
+        }
+    }
+    if (label) {
+        int tw = ui_text_w(label, lscale);
+        int tx = x + (w - tw) / 2;
+        int ty2 = y + (h - 8 * lscale) / 2;
+        splash_draw_text(fb, tx, ty2, lscale, label, border);
+    }
+}
+
+static bool ui_hit(int tx, int ty, int x, int y, int w, int h)
+{
+    return tx >= x && tx < x + w && ty >= y && ty < y + h;
+}
+
+/* Wait for next tap, clearing s_tap_pending before returning. */
+static void ui_wait_tap(uint16_t *out_x, uint16_t *out_y)
+{
+    s_tap_pending = false;
+    while (!s_tap_pending)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    s_tap_pending = false;
+    if (out_x) *out_x = s_tap_x;
+    if (out_y) *out_y = s_tap_y;
+}
+
+/* ── AP sort ──────────────────────────────────────────────────────────────── */
+
+#include "esp_wifi.h"   /* wifi_ap_record_t already included transitively */
+
+static int ap_cmp(const void *a, const void *b)
+{
+    const wifi_ap_record_t *ra = (const wifi_ap_record_t *)a;
+    const wifi_ap_record_t *rb = (const wifi_ap_record_t *)b;
+    bool a_air = (strncmp((char *)ra->ssid, "AIR", 3) == 0);
+    bool b_air = (strncmp((char *)rb->ssid, "AIR", 3) == 0);
+    if (a_air && !b_air) return -1;
+    if (!a_air &&  b_air) return  1;
+    return (int)rb->rssi - (int)ra->rssi;   /* stronger first */
+}
+
+/* ── Password keyboard screen ─────────────────────────────────────────────── */
+/* Returns when user taps OK (saves creds + restarts) or Back.                 */
+
+#define KB_KEY_W  37
+#define KB_KEY_H  42
+#define KB_GAP     3
+/* Row Y positions for 4 keyboard rows */
+#define KB_R0_Y  108
+#define KB_R1_Y  153
+#define KB_R2_Y  198
+#define KB_R3_Y  248
+
+/* Row x-starts for 10/9/8-key rows (keys are KB_KEY_W wide, KB_GAP apart) */
+#define KB_R0_X    8   /* 10 keys: (412 - 10*37 - 9*3)/2 ≈ 8 */
+#define KB_R1_X   27   /* 9  keys: center */
+#define KB_R2_X   47   /* 8  keys: center */
+
+static const char s_let_r0[] = "QWERTYUIOP";
+static const char s_let_r1[] = "ASDFGHJKL";
+static const char s_let_r2[] = "ZXCVBNM";
+static const char s_num_r0[] = "1234567890";
+static const char s_num_r1[] = "!@#$&*_-.";
+static const char s_num_r2[] = "+=(),:?";
+
+static void kb_draw(uint16_t *fb, const char *ssid, const char *pass,
+                    bool num_mode, bool shifted)
+{
+    const uint16_t white  = 0xFFFF;
+    const uint16_t gray   = __builtin_bswap16(0x39E7);  /* dark gray */
+    const uint16_t green  = __builtin_bswap16(0x07E0);
+    const uint16_t yellow = __builtin_bswap16(0xFFE0);
+
+    memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+
+    /* SSID line */
+    char ssid_disp[32];
+    snprintf(ssid_disp, sizeof(ssid_disp), "%.20s", ssid);
+    splash_draw_text(fb, 8, 10, 2, "WiFi:", white);
+    splash_draw_text(fb, 8 + ui_text_w("WiFi:", 2) + 4, 10, 2, ssid_disp, green);
+
+    /* Password line */
+    char pass_disp[48];
+    int plen = (int)strlen(pass);
+    /* show last ≤20 chars so it scrolls left as user types */
+    const char *pshow = (plen > 20) ? pass + plen - 20 : pass;
+    snprintf(pass_disp, sizeof(pass_disp), "Key:%s_", pshow);
+    splash_draw_text(fb, 8, 42, 2, pass_disp, yellow);
+
+    /* Separator */
+    ui_fill(fb, 0, 72, LCD_W, 2, gray);
+
+    /* Keyboard rows */
+    const char *r0 = num_mode ? s_num_r0 : s_let_r0;
+    const char *r1 = num_mode ? s_num_r1 : s_let_r1;
+    const char *r2 = num_mode ? s_num_r2 : s_let_r2;
+
+    struct { int x; const char *row; int n; int ky; } rows[] = {
+        { KB_R0_X, r0, (int)strlen(r0), KB_R0_Y },
+        { KB_R1_X, r1, (int)strlen(r1), KB_R1_Y },
+        { KB_R2_X, r2, (int)strlen(r2), KB_R2_Y },
+    };
+    for (int ri = 0; ri < 3; ri++) {
+        for (int ki = 0; ki < rows[ri].n; ki++) {
+            int kx = rows[ri].x + ki * (KB_KEY_W + KB_GAP);
+            char lbl[3] = { rows[ri].row[ki], 0, 0 };
+            /* letter mode: show uppercase label, output shifts on shifted flag */
+            if (!num_mode && lbl[0] >= 'A' && lbl[0] <= 'Z' && !shifted)
+                lbl[0] = lbl[0] - 'A' + 'a';  /* show lowercase label when not shifted */
+            ui_button(fb, kx, rows[ri].ky, KB_KEY_W, KB_KEY_H,
+                      lbl, 2, white, gray);
+        }
+        /* Backspace at end of row 2 */
+        if (ri == 2) {
+            int kx = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
+            ui_button(fb, kx, rows[ri].ky, KB_KEY_W, KB_KEY_H, "<", 2, white, gray);
+        }
+    }
+
+    /* Special row: [123/ABC]  [SHF]  [SPACE]  [OK] */
+    const uint16_t shift_clr = shifted ? yellow : white;
+    ui_button(fb,   8, KB_R3_Y, 68, 50, num_mode ? "ABC" : "123", 1, white, gray);
+    ui_button(fb,  82, KB_R3_Y, 68, 50, "SHF", 1, shift_clr, gray);
+    ui_button(fb, 156, KB_R3_Y, 130, 50, " ", 2, white, gray);   /* space bar */
+    ui_button(fb, 292, KB_R3_Y, 112, 50, "OK", 2, green, gray);
+}
+
+static void wifi_password_screen(uint16_t *fb, const char *ssid)
+{
+    char pass[65] = {0};
+    int  plen     = 0;
+    bool num_mode = false;
+    bool shifted  = false;
+
+    while (true) {
+        kb_draw(fb, ssid, pass, num_mode, shifted);
+        ui_flush(fb);
+
+        uint16_t tx, ty;
+        ui_wait_tap(&tx, &ty);
+
+        /* Special row */
+        if (ui_hit(tx, ty, 8, KB_R3_Y, 68, 50)) {
+            num_mode = !num_mode;
+            continue;
+        }
+        if (ui_hit(tx, ty, 82, KB_R3_Y, 68, 50)) {
+            shifted = !shifted;
+            continue;
+        }
+        if (ui_hit(tx, ty, 156, KB_R3_Y, 130, 50)) {
+            if (plen < 64) { pass[plen++] = ' '; pass[plen] = '\0'; }
+            continue;
+        }
+        if (ui_hit(tx, ty, 292, KB_R3_Y, 112, 50)) {
+            /* OK — save and restart */
+            wifi_creds_save(ssid, pass);
+            esp_restart();
+        }
+
+        /* Keyboard rows */
+        struct { int x; const char *row; int n; int ky; } rows[] = {
+            { KB_R0_X, num_mode ? s_num_r0 : s_let_r0,
+              (int)strlen(num_mode ? s_num_r0 : s_let_r0), KB_R0_Y },
+            { KB_R1_X, num_mode ? s_num_r1 : s_let_r1,
+              (int)strlen(num_mode ? s_num_r1 : s_let_r1), KB_R1_Y },
+            { KB_R2_X, num_mode ? s_num_r2 : s_let_r2,
+              (int)strlen(num_mode ? s_num_r2 : s_let_r2), KB_R2_Y },
+        };
+        bool handled = false;
+        for (int ri = 0; ri < 3 && !handled; ri++) {
+            if (!ui_hit(tx, ty, rows[ri].x, rows[ri].ky,
+                        rows[ri].n * (KB_KEY_W + KB_GAP) + KB_KEY_W, KB_KEY_H))
+                continue;
+            /* Backspace at the end of row 2 */
+            int bsp_x = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
+            if (ri == 2 && ui_hit(tx, ty, bsp_x, rows[ri].ky, KB_KEY_W, KB_KEY_H)) {
+                if (plen > 0) pass[--plen] = '\0';
+                handled = true;
+                break;
+            }
+            int ki = (tx - rows[ri].x) / (KB_KEY_W + KB_GAP);
+            if (ki >= 0 && ki < rows[ri].n) {
+                char ch = rows[ri].row[ki];
+                /* Letter mode: apply shift */
+                if (!num_mode && ch >= 'A' && ch <= 'Z') {
+                    if (!shifted) ch = ch - 'A' + 'a';
+                }
+                if (plen < 64) { pass[plen++] = ch; pass[plen] = '\0'; }
+                handled = true;
+            }
+        }
+    }
+}
+
+/* ── AP scan & selection screen ───────────────────────────────────────────── */
+
+#define AP_MAX       16
+#define AP_ROW_H     48
+#define AP_LIST_Y    65
+#define AP_LIST_ROWS  6
+#define AP_RESCAN_US 4000000LL   /* rescan interval: 4 s */
+
+static volatile bool s_scan_done = false;
+
+static void scan_done_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    s_scan_done = true;
+}
+
+static void ap_list_draw(uint16_t *fb, wifi_ap_record_t *aps, int show_n,
+                          bool scanning)
+{
+    const uint16_t white = 0xFFFF;
+    const uint16_t green = __builtin_bswap16(0x07E0);
+    const uint16_t gray  = __builtin_bswap16(0x39E7);
+    const uint16_t dim   = __builtin_bswap16(0x7BEF);   /* mid-gray for hint */
+
+    memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+
+    /* Header + optional scanning badge */
+    ui_text_center(fb, 0, LCD_W, 14, 2, "Select WiFi", white);
+    if (scanning)
+        splash_draw_text(fb, LCD_W - ui_text_w("...", 2) - 6, 14, 2, "...", dim);
+
+    if (show_n == 0) {
+        ui_text_center(fb, 0, LCD_W, LCD_H / 2 - 8, 2,
+                       scanning ? "Scanning..." : "No networks", white);
+    } else {
+        for (int i = 0; i < show_n; i++) {
+            int ry = AP_LIST_Y + i * AP_ROW_H;
+            bool is_air = (strncmp((char *)aps[i].ssid, "AIR", 3) == 0);
+            ui_fill(fb, 6, ry, 400, AP_ROW_H - 4, is_air ? gray : 0x0000);
+            ui_fill(fb, 6,       ry,              400, 2, white);
+            ui_fill(fb, 6,       ry + AP_ROW_H-6, 400, 2, white);
+            ui_fill(fb, 6,       ry,              2, AP_ROW_H-4, white);
+            ui_fill(fb, 6+400-2, ry,              2, AP_ROW_H-4, white);
+
+            char ssid_buf[20];
+            snprintf(ssid_buf, sizeof(ssid_buf), "%.17s", (char *)aps[i].ssid);
+            splash_draw_text(fb, 14, ry + 8, 2, ssid_buf, is_air ? green : white);
+
+            int rssi = aps[i].rssi;
+            int bars = (rssi > -55) ? 3 : (rssi > -70) ? 2 : 1;
+            for (int b = 0; b < 3; b++) {
+                uint16_t bc = (b < bars) ? green : gray;
+                int bh  = 6 + b * 5;
+                int bby = ry + AP_ROW_H - 6 - bh;
+                ui_fill(fb, 380 + b * 8, bby, 6, bh, bc);
+            }
+        }
+    }
+
+    ui_button(fb, (LCD_W - 140) / 2, 363, 140, 40, "Cancel", 2, white, 0x0000);
+    ui_flush(fb);
+}
+
+static void wifi_scan_screen(uint16_t *fb, char *out_ssid)
+{
+    static wifi_ap_record_t aps[AP_MAX];
+    int ap_n  = 0, show_n = 0;
+    bool scanning  = true;   /* true while a scan is in flight */
+    bool has_list  = false;  /* true once we have at least one result set */
+
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                scan_done_handler, NULL);
+
+    /* Kick off first non-blocking scan */
+    s_scan_done = false;
+    wifi_scan_config_t scfg = { 0 };
+    esp_wifi_scan_start(&scfg, false);
+    int64_t last_scan_start_us = esp_timer_get_time();
+
+    /* Initial "Scanning..." frame */
+    ap_list_draw(fb, aps, 0, true);
+
+    while (true) {
+        /* ── Collect results when scan completes ───────────────────────── */
+        if (s_scan_done) {
+            s_scan_done = false;
+            uint16_t n  = AP_MAX;
+            esp_wifi_scan_get_ap_records(&n, aps);
+            ap_n   = (int)n;
+            show_n = ap_n > AP_LIST_ROWS ? AP_LIST_ROWS : ap_n;
+            qsort(aps, ap_n, sizeof(wifi_ap_record_t), ap_cmp);
+            scanning  = false;
+            has_list  = true;
+            ap_list_draw(fb, aps, show_n, false);
+        }
+
+        /* ── Kick off a rescan every AP_RESCAN_US ──────────────────────── */
+        if (!scanning &&
+            (esp_timer_get_time() - last_scan_start_us) > AP_RESCAN_US) {
+            s_scan_done = false;
+            esp_wifi_scan_start(&scfg, false);
+            last_scan_start_us = esp_timer_get_time();
+            scanning = true;
+            /* Keep the existing list visible; just show the "..." badge */
+            ap_list_draw(fb, aps, show_n, true);
+        }
+
+        /* ── Handle taps ───────────────────────────────────────────────── */
+        if (s_tap_pending) {
+            s_tap_pending = false;
+            uint16_t tx = s_tap_x, ty = s_tap_y;
+
+            if (ui_hit(tx, ty, (LCD_W - 140) / 2, 363, 140, 40)) {
+                /* Cancel — stop any running scan before returning */
+                esp_wifi_scan_stop();
+                esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                             scan_done_handler);
+                out_ssid[0] = '\0';
+                return;
+            }
+
+            if (has_list) {
+                for (int i = 0; i < show_n; i++) {
+                    int ry = AP_LIST_Y + i * AP_ROW_H;
+                    if (ui_hit(tx, ty, 6, ry, 400, AP_ROW_H - 4)) {
+                        esp_wifi_scan_stop();
+                        esp_event_handler_unregister(WIFI_EVENT,
+                                                     WIFI_EVENT_SCAN_DONE,
+                                                     scan_done_handler);
+                        strncpy(out_ssid, (char *)aps[i].ssid, 32);
+                        out_ssid[32] = '\0';
+                        return;
+                    }
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+/* Entry point for the full setup flow. Called after wifi_driver_init(). */
+static void wifi_setup_flow(void)
+{
+    uint16_t *fb = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t),
+                                    MALLOC_CAP_SPIRAM);
+    if (!fb) return;
+
+    char selected_ssid[33] = {0};
+    wifi_scan_screen(fb, selected_ssid);
+
+    if (selected_ssid[0] != '\0') {
+        wifi_password_screen(fb, selected_ssid);
+        /* wifi_password_screen restarts on OK; only returns on Back */
+    }
+
+    heap_caps_free(fb);
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────────── */
 
 void app_main(void)
@@ -1961,16 +2513,63 @@ void app_main(void)
     display_init();
     touch_init();
     xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
+
+    /* ── Setup mode: triggered by a flag written to NVS when the user tapped
+       "WiFi Setup" on the connecting screen during a previous boot.  Checked
+       first so we never start a connection we immediately have to tear down. */
+    {
+        nvs_handle_t h;
+        uint8_t setup_flag = 0;
+        if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_get_u8(h, "setup_req", &setup_flag);
+            if (setup_flag) {
+                nvs_set_u8(h, "setup_req", 0);
+                nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+        if (setup_flag) {
+            wifi_driver_init();   /* bare init for scanning, no connect */
+            wifi_setup_flow();    /* scan → AP list → keyboard → save+restart */
+            esp_restart();        /* reached only if user cancelled */
+        }
+    }
+
+    /* ── Normal boot: render connecting screen, then start WiFi.
+       The 150 ms delay lets the camera's AP finish its own boot sequence;
+       the screen render takes ~30 ms so total is safely within the 1100 ms
+       window before the first WPA2 handshake attempt. */
     display_splash();
-
-    /* The PSRAM memtest removal saved ~320 ms, which caused WiFi to start
-       ~320 ms earlier than before. The camera's AP needs ~1100 ms from
-       ESP32 power-on to be ready for a WPA2 handshake; connecting earlier
-       causes a reliable first-attempt handshake timeout (reason 201) and a
-       full retry, costing ~3 extra seconds. This delay restores the window. */
     vTaskDelay(pdMS_TO_TICKS(150));
+    wifi_begin_connecting();   /* non-blocking — STA_START fires connect */
 
-    wifi_init();
+    /* ── Connecting-screen poll loop.
+       WiFi handshake runs entirely in the background (lwIP / WPA2 stack tasks).
+       We just check the event-group bit every 20 ms alongside the touch state.
+       This adds zero latency to the connection. */
+    const int BTN_X = (LCD_W - 160) / 2, BTN_Y = LCD_H / 2 + 20;
+    const int BTN_W = 160, BTN_H = 44;
+    s_tap_pending = false;
+    for (;;) {
+        if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)
+            break;   /* connected — proceed normally */
+
+        if (s_tap_pending) {
+            s_tap_pending = false;
+            if (s_tap_x >= BTN_X && s_tap_x < BTN_X + BTN_W &&
+                s_tap_y >= BTN_Y && s_tap_y < BTN_Y + BTN_H) {
+                /* Write the flag and restart; WiFi driver starts fresh. */
+                nvs_handle_t h;
+                if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_u8(h, "setup_req", 1);
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                esp_restart();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 
     uint8_t  *jpeg_buf = heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
     uint16_t *fb       = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
