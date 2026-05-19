@@ -1328,8 +1328,28 @@ static void display_splash(void)
                      scale, text, 0xFFFF);
 
     const uint16_t green = __builtin_bswap16(0x07E0);
-    splash_draw_button(fb, (LCD_W - 160) / 2, LCD_H / 2 + 20, 160, 44,
+    splash_draw_button(fb, (LCD_W - 210) / 2, LCD_H / 2 + 20, 210, 44,
                        "WiFi Setup", green, 0x0000);
+
+    splash_flush(fb);
+    heap_caps_free(fb);
+}
+
+/* Push "Connected!" in green to the LCD — called immediately after WiFi connects,
+   stays visible until the first liveview frame overwrites it. */
+static void display_connected(void)
+{
+    uint16_t *fb = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t),
+                                    MALLOC_CAP_SPIRAM);
+    if (!fb) return;
+    memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+
+    const uint16_t green = __builtin_bswap16(0x07E0);
+    const char *text = "Connected!";
+    const int scale = 2, cw = 8 * scale, gap = scale;
+    int len = (int)strlen(text);
+    int tw  = len * cw + (len - 1) * gap;
+    splash_draw_text(fb, (LCD_W - tw) / 2, LCD_H / 2 - cw - 30, scale, text, green);
 
     splash_flush(fb);
     heap_caps_free(fb);
@@ -2190,154 +2210,253 @@ static int ap_cmp(const void *a, const void *b)
 }
 
 /* ── Password keyboard screen ─────────────────────────────────────────────── */
-/* Returns when user taps OK (saves creds + restarts) or Back.                 */
+/* Three layers: LAYER_NUM (default, 3×4 numpad), LAYER_ALPHA (QWERTY),        */
+/* LAYER_SYM (symbols). Starts on LAYER_NUM (Olympus Air uses digit passwords). */
 
-#define KB_KEY_W  37
-#define KB_KEY_H  42
-#define KB_GAP     3
-/* Row Y positions for 4 keyboard rows */
-#define KB_R0_Y  108
-#define KB_R1_Y  153
-#define KB_R2_Y  198
-#define KB_R3_Y  248
+typedef enum { LAYER_NUM = 0, LAYER_ALPHA = 1, LAYER_SYM = 2 } kb_layer_t;
 
-/* Row x-starts for 10/9/8-key rows (keys are KB_KEY_W wide, KB_GAP apart) */
-#define KB_R0_X    8   /* 10 keys: (412 - 10*37 - 9*3)/2 ≈ 8 */
-#define KB_R1_X   27   /* 9  keys: center */
-#define KB_R2_X   47   /* 8  keys: center */
+/* Numeric keypad — 3 cols × 4 rows, phone-pad layout */
+#define NP_KEY_W  100
+#define NP_KEY_H   45   /* 10 % shorter than original 50 */
+#define NP_GAP      6
+#define NP_X       50   /* (412 - 3*100 - 2*6) / 2 */
+#define NP_R0_Y   124
+#define NP_R1_Y   175   /* NP_R0_Y + NP_KEY_H + NP_GAP */
+#define NP_R2_Y   226
+#define NP_R3_Y   277
+#define NP_BOT_Y  328   /* layer-select row for NUM */
+#define NP_BOT_H   40
+
+
+/* QWERTY alpha layer */
+#define KB_KEY_W   37
+#define KB_KEY_H   42
+#define KB_GAP      3
+#define KB_R0_Y   124
+#define KB_R1_Y   169   /* KB_R0_Y + KB_KEY_H + KB_GAP */
+#define KB_R2_Y   214
+#define KB_ACT_Y  262   /* SHF + SPACE action row */
+#define KB_ACT_H   44
+#define KB_BOT_Y  312   /* layer-select row for ALPHA */
+#define KB_BOT_H   40
+#define KB_R0_X     8   /* x-start: 10-key row  (412-10*37-9*3)/2  */
+#define KB_R1_X    27   /* x-start:  9-key row  (412-9*37-8*3)/2   */
+#define KB_R2_X    47   /* x-start:  8-key row  (7 letters + bsp)  */
+
+/* Symbol layer uses KB_KEY_W/H/GAP; no extra action row needed */
+#define SY_R0_X    87   /* (412 - 6*37 - 5*3) / 2  — 6-key row */
+#define SY_R1_X    67   /* (412 - 7*37 - 6*3) / 2  — 7-key row */
+#define SY_BOT_Y  262   /* layer-select row for SYM */
+#define SY_BOT_H   40
 
 static const char s_let_r0[] = "QWERTYUIOP";
 static const char s_let_r1[] = "ASDFGHJKL";
 static const char s_let_r2[] = "ZXCVBNM";
-static const char s_num_r0[] = "1234567890";
-static const char s_num_r1[] = "!@#$&*_-.";
-static const char s_num_r2[] = "+=(),:?";
+static const char s_sym_r0[] = "!@#$%&";    /* 6 chars, x=SY_R0_X */
+static const char s_sym_r1[] = "*()-_+=";   /* 7 chars, x=SY_R1_X */
+static const char s_sym_r2[] = "/?.,;:";    /* 6 chars + bsp, x=SY_R1_X */
 
 static void kb_draw(uint16_t *fb, const char *ssid, const char *pass,
-                    bool num_mode, bool shifted)
+                    kb_layer_t layer, bool shifted)
 {
     const uint16_t white  = 0xFFFF;
-    const uint16_t gray   = __builtin_bswap16(0x39E7);  /* dark gray */
+    const uint16_t gray   = __builtin_bswap16(0x39E7);
     const uint16_t green  = __builtin_bswap16(0x07E0);
     const uint16_t yellow = __builtin_bswap16(0xFFE0);
+    const uint16_t red    = __builtin_bswap16(0xF800);
 
     memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
 
-    /* SSID line */
-    char ssid_disp[32];
-    snprintf(ssid_disp, sizeof(ssid_disp), "%.20s", ssid);
-    splash_draw_text(fb, 8, 10, 2, "WiFi:", white);
-    splash_draw_text(fb, 8 + ui_text_w("WiFi:", 2) + 4, 10, 2, ssid_disp, green);
+    /* SSID line — centered; truncate to 10 chars to fit the circular screen */
+    char ssid_trunc[11];
+    snprintf(ssid_trunc, sizeof(ssid_trunc), "%.10s", ssid);
+    {
+        int pw = ui_text_w("WiFi:", 2);
+        int sw = ui_text_w(ssid_trunc, 2);
+        int hx = (LCD_W - pw - 4 - sw) / 2;
+        splash_draw_text(fb, hx, 54, 2, "WiFi:", white);
+        splash_draw_text(fb, hx + pw + 4, 54, 2, ssid_trunc, green);
+    }
 
-    /* Password line */
-    char pass_disp[48];
+    /* Password field — indented 3 characters right of left edge */
     int plen = (int)strlen(pass);
-    /* show last ≤20 chars so it scrolls left as user types */
     const char *pshow = (plen > 20) ? pass + plen - 20 : pass;
+    char pass_disp[48];
     snprintf(pass_disp, sizeof(pass_disp), "Key:%s_", pshow);
-    splash_draw_text(fb, 8, 42, 2, pass_disp, yellow);
+    splash_draw_text(fb, 60, 94, 2, pass_disp, yellow);
 
-    /* Separator */
-    ui_fill(fb, 0, 72, LCD_W, 2, gray);
+    ui_fill(fb, 0, 118, LCD_W, 2, gray);   /* separator */
 
-    /* Keyboard rows */
-    const char *r0 = num_mode ? s_num_r0 : s_let_r0;
-    const char *r1 = num_mode ? s_num_r1 : s_let_r1;
-    const char *r2 = num_mode ? s_num_r2 : s_let_r2;
-
-    struct { int x; const char *row; int n; int ky; } rows[] = {
-        { KB_R0_X, r0, (int)strlen(r0), KB_R0_Y },
-        { KB_R1_X, r1, (int)strlen(r1), KB_R1_Y },
-        { KB_R2_X, r2, (int)strlen(r2), KB_R2_Y },
-    };
-    for (int ri = 0; ri < 3; ri++) {
-        for (int ki = 0; ki < rows[ri].n; ki++) {
-            int kx = rows[ri].x + ki * (KB_KEY_W + KB_GAP);
-            char lbl[3] = { rows[ri].row[ki], 0, 0 };
-            /* letter mode: show uppercase label, output shifts on shifted flag */
-            if (!num_mode && lbl[0] >= 'A' && lbl[0] <= 'Z' && !shifted)
-                lbl[0] = lbl[0] - 'A' + 'a';  /* show lowercase label when not shifted */
-            ui_button(fb, kx, rows[ri].ky, KB_KEY_W, KB_KEY_H,
-                      lbl, 2, white, gray);
+    if (layer == LAYER_NUM) {
+        /* 3×4 phone numpad */
+        static const char *const np_rows[] = { "123", "456", "789" };
+        for (int ri = 0; ri < 3; ri++) {
+            int ry = NP_R0_Y + ri * (NP_KEY_H + NP_GAP);
+            for (int ki = 0; ki < 3; ki++) {
+                char lbl[2] = { np_rows[ri][ki], '\0' };
+                ui_button(fb, NP_X + ki * (NP_KEY_W + NP_GAP), ry,
+                          NP_KEY_W, NP_KEY_H, lbl, 3, white, gray);
+            }
         }
-        /* Backspace at end of row 2 */
-        if (ri == 2) {
-            int kx = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
-            ui_button(fb, kx, rows[ri].ky, KB_KEY_W, KB_KEY_H, "<", 2, white, gray);
+        /* Row 3: .  0  ← */
+        ui_button(fb, NP_X,                        NP_R3_Y, NP_KEY_W, NP_KEY_H, ".",  3, white, gray);
+        ui_button(fb, NP_X +   (NP_KEY_W+NP_GAP),  NP_R3_Y, NP_KEY_W, NP_KEY_H, "0",  3, white, gray);
+        ui_button(fb, NP_X + 2*(NP_KEY_W+NP_GAP),  NP_R3_Y, NP_KEY_W, NP_KEY_H, "<",  3, white, gray);
+    } else if (layer == LAYER_ALPHA) {
+        /* QWERTY rows */
+        struct { int x; const char *row; int n; int ky; } rows[] = {
+            { KB_R0_X, s_let_r0, 10, KB_R0_Y },
+            { KB_R1_X, s_let_r1,  9, KB_R1_Y },
+            { KB_R2_X, s_let_r2,  7, KB_R2_Y },
+        };
+        for (int ri = 0; ri < 3; ri++) {
+            for (int ki = 0; ki < rows[ri].n; ki++) {
+                char lbl[2] = { rows[ri].row[ki], '\0' };
+                if (!shifted && lbl[0] >= 'A' && lbl[0] <= 'Z')
+                    lbl[0] = lbl[0] - 'A' + 'a';
+                ui_button(fb, rows[ri].x + ki*(KB_KEY_W+KB_GAP), rows[ri].ky,
+                          KB_KEY_W, KB_KEY_H, lbl, 2, white, gray);
+            }
+            if (ri == 2) {
+                int bsp_x = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
+                ui_button(fb, bsp_x, rows[ri].ky, KB_KEY_W, KB_KEY_H, "<", 2, white, gray);
+            }
+        }
+        /* Action row: SHF + SPACE */
+        ui_button(fb,  52, KB_ACT_Y, 80, KB_ACT_H, "SHF", 1,
+                  shifted ? yellow : white, gray);
+        ui_button(fb, 140, KB_ACT_Y, 220, KB_ACT_H, " ", 2, white, gray);
+
+    } else { /* LAYER_SYM */
+        /* Symbol rows (same key size as QWERTY) */
+        struct { int x; const char *row; int n; int ky; } rows[] = {
+            { SY_R0_X, s_sym_r0, 6, KB_R0_Y },
+            { SY_R1_X, s_sym_r1, 7, KB_R1_Y },
+            { SY_R1_X, s_sym_r2, 6, KB_R2_Y },
+        };
+        for (int ri = 0; ri < 3; ri++) {
+            for (int ki = 0; ki < rows[ri].n; ki++) {
+                char lbl[2] = { rows[ri].row[ki], '\0' };
+                ui_button(fb, rows[ri].x + ki*(KB_KEY_W+KB_GAP), rows[ri].ky,
+                          KB_KEY_W, KB_KEY_H, lbl, 2, white, gray);
+            }
+            if (ri == 2) {
+                int bsp_x = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
+                ui_button(fb, bsp_x, rows[ri].ky, KB_KEY_W, KB_KEY_H, "<", 2, white, gray);
+            }
         }
     }
 
-    /* Special row: [123/ABC]  [SHF]  [SPACE]  [OK] */
-    const uint16_t shift_clr = shifted ? yellow : white;
-    ui_button(fb,   8, KB_R3_Y, 68, 50, num_mode ? "ABC" : "123", 1, white, gray);
-    ui_button(fb,  82, KB_R3_Y, 68, 50, "SHF", 1, shift_clr, gray);
-    ui_button(fb, 156, KB_R3_Y, 130, 50, " ", 2, white, gray);   /* space bar */
-    ui_button(fb, 292, KB_R3_Y, 112, 50, "OK", 2, green, gray);
+    /* Shared bottom row — fixed position on every layer */
+    static const char *const cycle_lbl[] = { "ABC", "SYM", "123" };
+    ui_button(fb,  95, NP_BOT_Y, 72, NP_BOT_H, "Cancel",         1, red,   0x0000);
+    ui_button(fb, 175, NP_BOT_Y, 72, NP_BOT_H, cycle_lbl[layer], 1, white, gray);
+    ui_button(fb, 255, NP_BOT_Y, 72, NP_BOT_H, "OK",             2, green, gray);
 }
 
 static void wifi_password_screen(uint16_t *fb, const char *ssid)
 {
-    char pass[65] = {0};
-    int  plen     = 0;
-    bool num_mode = false;
-    bool shifted  = false;
+    char pass[65]    = {0};
+    int  plen        = 0;
+    kb_layer_t layer = LAYER_NUM;
+    bool shifted     = false;
 
-    while (true) {
-        kb_draw(fb, ssid, pass, num_mode, shifted);
+    for (;;) {
+        kb_draw(fb, ssid, pass, layer, shifted);
         ui_flush(fb);
 
         uint16_t tx, ty;
         ui_wait_tap(&tx, &ty);
 
-        /* Special row */
-        if (ui_hit(tx, ty, 8, KB_R3_Y, 68, 50)) {
-            num_mode = !num_mode;
+        /* Shared bottom row — same coordinates on every layer */
+        if (ui_hit(tx, ty, 95, NP_BOT_Y, 72, NP_BOT_H)) { esp_restart(); }
+        if (ui_hit(tx, ty, 175, NP_BOT_Y, 72, NP_BOT_H)) {
+            layer   = (kb_layer_t)((layer + 1) % 3);
+            shifted = false;
             continue;
         }
-        if (ui_hit(tx, ty, 82, KB_R3_Y, 68, 50)) {
-            shifted = !shifted;
-            continue;
-        }
-        if (ui_hit(tx, ty, 156, KB_R3_Y, 130, 50)) {
-            if (plen < 64) { pass[plen++] = ' '; pass[plen] = '\0'; }
-            continue;
-        }
-        if (ui_hit(tx, ty, 292, KB_R3_Y, 112, 50)) {
-            /* OK — save and restart */
-            wifi_creds_save(ssid, pass);
-            esp_restart();
+        if (ui_hit(tx, ty, 255, NP_BOT_Y, 72, NP_BOT_H)) {
+            wifi_creds_save(ssid, pass); esp_restart();
         }
 
-        /* Keyboard rows */
-        struct { int x; const char *row; int n; int ky; } rows[] = {
-            { KB_R0_X, num_mode ? s_num_r0 : s_let_r0,
-              (int)strlen(num_mode ? s_num_r0 : s_let_r0), KB_R0_Y },
-            { KB_R1_X, num_mode ? s_num_r1 : s_let_r1,
-              (int)strlen(num_mode ? s_num_r1 : s_let_r1), KB_R1_Y },
-            { KB_R2_X, num_mode ? s_num_r2 : s_let_r2,
-              (int)strlen(num_mode ? s_num_r2 : s_let_r2), KB_R2_Y },
-        };
-        bool handled = false;
-        for (int ri = 0; ri < 3 && !handled; ri++) {
-            if (!ui_hit(tx, ty, rows[ri].x, rows[ri].ky,
-                        rows[ri].n * (KB_KEY_W + KB_GAP) + KB_KEY_W, KB_KEY_H))
-                continue;
-            /* Backspace at the end of row 2 */
-            int bsp_x = rows[ri].x + rows[ri].n * (KB_KEY_W + KB_GAP);
-            if (ri == 2 && ui_hit(tx, ty, bsp_x, rows[ri].ky, KB_KEY_W, KB_KEY_H)) {
-                if (plen > 0) pass[--plen] = '\0';
-                handled = true;
+        if (layer == LAYER_NUM) {
+            /* Digit rows 0-2: '1'-'9' */
+            for (int ri = 0; ri < 3; ri++) {
+                int ry = NP_R0_Y + ri * (NP_KEY_H + NP_GAP);
+                if (!ui_hit(tx, ty, NP_X, ry, 3*(NP_KEY_W+NP_GAP), NP_KEY_H))
+                    continue;
+                int ki = (tx - NP_X) / (NP_KEY_W + NP_GAP);
+                if (ki >= 0 && ki < 3 && plen < 64) {
+                    pass[plen++] = '1' + ri * 3 + ki;
+                    pass[plen]   = '\0';
+                }
                 break;
             }
-            int ki = (tx - rows[ri].x) / (KB_KEY_W + KB_GAP);
-            if (ki >= 0 && ki < rows[ri].n) {
-                char ch = rows[ri].row[ki];
-                /* Letter mode: apply shift */
-                if (!num_mode && ch >= 'A' && ch <= 'Z') {
-                    if (!shifted) ch = ch - 'A' + 'a';
+            /* Row 3: .  0  ← */
+            if (ui_hit(tx, ty, NP_X, NP_R3_Y, NP_KEY_W, NP_KEY_H)) {
+                if (plen < 64) { pass[plen++] = '.'; pass[plen] = '\0'; }
+            } else if (ui_hit(tx, ty, NP_X+(NP_KEY_W+NP_GAP), NP_R3_Y, NP_KEY_W, NP_KEY_H)) {
+                if (plen < 64) { pass[plen++] = '0'; pass[plen] = '\0'; }
+            } else if (ui_hit(tx, ty, NP_X+2*(NP_KEY_W+NP_GAP), NP_R3_Y, NP_KEY_W, NP_KEY_H)) {
+                if (plen > 0) pass[--plen] = '\0';
+            }
+
+        } else if (layer == LAYER_ALPHA) {
+            /* Action row: SHF, SPACE */
+            if (ui_hit(tx, ty,  52, KB_ACT_Y,  80, KB_ACT_H)) {
+                shifted = !shifted; continue;
+            }
+            if (ui_hit(tx, ty, 140, KB_ACT_Y, 220, KB_ACT_H)) {
+                if (plen < 64) { pass[plen++] = ' '; pass[plen] = '\0'; }
+                continue;
+            }
+            /* QWERTY rows */
+            struct { int x; const char *row; int n; int ky; } arows[] = {
+                { KB_R0_X, s_let_r0, 10, KB_R0_Y },
+                { KB_R1_X, s_let_r1,  9, KB_R1_Y },
+                { KB_R2_X, s_let_r2,  7, KB_R2_Y },
+            };
+            for (int ri = 0; ri < 3; ri++) {
+                if (!ui_hit(tx, ty, arows[ri].x, arows[ri].ky,
+                            arows[ri].n*(KB_KEY_W+KB_GAP)+KB_KEY_W, KB_KEY_H))
+                    continue;
+                int bsp_x = arows[ri].x + arows[ri].n * (KB_KEY_W + KB_GAP);
+                if (ri == 2 && ui_hit(tx, ty, bsp_x, arows[ri].ky, KB_KEY_W, KB_KEY_H)) {
+                    if (plen > 0) pass[--plen] = '\0';
+                    break;
                 }
-                if (plen < 64) { pass[plen++] = ch; pass[plen] = '\0'; }
-                handled = true;
+                int ki = (tx - arows[ri].x) / (KB_KEY_W + KB_GAP);
+                if (ki >= 0 && ki < arows[ri].n && plen < 64) {
+                    char ch = arows[ri].row[ki];
+                    if (!shifted && ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+                    pass[plen++] = ch;
+                    pass[plen]   = '\0';
+                }
+                break;
+            }
+
+        } else { /* LAYER_SYM */
+            /* Symbol rows */
+            struct { int x; const char *row; int n; int ky; } srows[] = {
+                { SY_R0_X, s_sym_r0, 6, KB_R0_Y },
+                { SY_R1_X, s_sym_r1, 7, KB_R1_Y },
+                { SY_R1_X, s_sym_r2, 6, KB_R2_Y },
+            };
+            for (int ri = 0; ri < 3; ri++) {
+                if (!ui_hit(tx, ty, srows[ri].x, srows[ri].ky,
+                            srows[ri].n*(KB_KEY_W+KB_GAP)+KB_KEY_W, KB_KEY_H))
+                    continue;
+                int bsp_x = srows[ri].x + srows[ri].n * (KB_KEY_W + KB_GAP);
+                if (ri == 2 && ui_hit(tx, ty, bsp_x, srows[ri].ky, KB_KEY_W, KB_KEY_H)) {
+                    if (plen > 0) pass[--plen] = '\0';
+                    break;
+                }
+                int ki = (tx - srows[ri].x) / (KB_KEY_W + KB_GAP);
+                if (ki >= 0 && ki < srows[ri].n && plen < 64) {
+                    pass[plen++] = srows[ri].row[ki];
+                    pass[plen]   = '\0';
+                }
+                break;
             }
         }
     }
@@ -2346,10 +2465,12 @@ static void wifi_password_screen(uint16_t *fb, const char *ssid)
 /* ── AP scan & selection screen ───────────────────────────────────────────── */
 
 #define AP_MAX       16
-#define AP_ROW_H     48
-#define AP_LIST_Y    65
-#define AP_LIST_ROWS  6
-#define AP_RESCAN_US 4000000LL   /* rescan interval: 4 s */
+#define AP_ROW_H     44            /* row pitch, no extra gap */
+#define AP_LIST_Y    108           /* list top; header sits at y=62 */
+#define AP_LIST_ROWS  5            /* 5 × 44 = 220 px, cancel fits below */
+#define AP_LIST_X    ((LCD_W - 300) / 2)   /* 56 px — centred 300 px list */
+#define AP_LIST_W    300           /* 25 % narrower than the old 400 px */
+#define AP_RESCAN_US 4000000LL     /* rescan interval: 4 s */
 
 static volatile bool s_scan_done = false;
 
@@ -2365,44 +2486,61 @@ static void ap_list_draw(uint16_t *fb, wifi_ap_record_t *aps, int show_n,
     const uint16_t white = 0xFFFF;
     const uint16_t green = __builtin_bswap16(0x07E0);
     const uint16_t gray  = __builtin_bswap16(0x39E7);
-    const uint16_t dim   = __builtin_bswap16(0x7BEF);   /* mid-gray for hint */
+    const uint16_t dim   = __builtin_bswap16(0x7BEF);
 
     memset(fb, 0x00, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
 
-    /* Header + optional scanning badge */
-    ui_text_center(fb, 0, LCD_W, 14, 2, "Select WiFi", white);
+    /* Header — moved down one AP_ROW_H from the original y=14 */
+    ui_text_center(fb, 0, LCD_W, 62, 2, "Select WiFi", white);
     if (scanning)
-        splash_draw_text(fb, LCD_W - ui_text_w("...", 2) - 6, 14, 2, "...", dim);
+        splash_draw_text(fb, LCD_W - ui_text_w("...", 2) - 70, 62, 2, "...", dim);
 
     if (show_n == 0) {
         ui_text_center(fb, 0, LCD_W, LCD_H / 2 - 8, 2,
                        scanning ? "Scanning..." : "No networks", white);
     } else {
+        /* Row fills — content sits 1 px inside the borders */
         for (int i = 0; i < show_n; i++) {
-            int ry = AP_LIST_Y + i * AP_ROW_H;
+            int ry     = AP_LIST_Y + i * AP_ROW_H;
             bool is_air = (strncmp((char *)aps[i].ssid, "AIR", 3) == 0);
-            ui_fill(fb, 6, ry, 400, AP_ROW_H - 4, is_air ? gray : 0x0000);
-            ui_fill(fb, 6,       ry,              400, 2, white);
-            ui_fill(fb, 6,       ry + AP_ROW_H-6, 400, 2, white);
-            ui_fill(fb, 6,       ry,              2, AP_ROW_H-4, white);
-            ui_fill(fb, 6+400-2, ry,              2, AP_ROW_H-4, white);
 
-            char ssid_buf[20];
-            snprintf(ssid_buf, sizeof(ssid_buf), "%.17s", (char *)aps[i].ssid);
-            splash_draw_text(fb, 14, ry + 8, 2, ssid_buf, is_air ? green : white);
+            ui_fill(fb, AP_LIST_X + 1, ry + 1,
+                    AP_LIST_W - 2, AP_ROW_H - 1,
+                    is_air ? gray : 0x0000);
 
+            /* SSID — 13 chars max at scale 2 fits the narrower list */
+            char ssid_buf[15];
+            snprintf(ssid_buf, sizeof(ssid_buf), "%.13s", (char *)aps[i].ssid);
+            int ty_text = ry + (AP_ROW_H - 16) / 2;
+            splash_draw_text(fb, AP_LIST_X + 8, ty_text, 2, ssid_buf,
+                             is_air ? green : white);
+
+            /* Signal bars, right-aligned inside the list */
             int rssi = aps[i].rssi;
             int bars = (rssi > -55) ? 3 : (rssi > -70) ? 2 : 1;
             for (int b = 0; b < 3; b++) {
                 uint16_t bc = (b < bars) ? green : gray;
                 int bh  = 6 + b * 5;
                 int bby = ry + AP_ROW_H - 6 - bh;
-                ui_fill(fb, 380 + b * 8, bby, 6, bh, bc);
+                /* rightmost bar ends 10 px from the list's right edge */
+                ui_fill(fb, AP_LIST_X + AP_LIST_W - 44 + b * 8, bby, 6, bh, bc);
             }
         }
+
+        /* Single outer border + 1 px dividers between rows.
+           Bottom of row N == top of row N+1 → thin shared line. */
+        int lx = AP_LIST_X, lw = AP_LIST_W;
+        int lt = AP_LIST_Y, lb = AP_LIST_Y + show_n * AP_ROW_H;
+
+        ui_fill(fb, lx, lt, lw, 1, white);          /* top */
+        ui_fill(fb, lx, lb, lw, 1, white);          /* bottom */
+        ui_fill(fb, lx,          lt, 1, lb - lt, white);  /* left */
+        ui_fill(fb, lx + lw - 1, lt, 1, lb - lt, white);  /* right */
+        for (int i = 1; i < show_n; i++)
+            ui_fill(fb, lx, AP_LIST_Y + i * AP_ROW_H, lw, 1, white); /* dividers */
     }
 
-    ui_button(fb, (LCD_W - 140) / 2, 363, 140, 40, "Cancel", 2, white, 0x0000);
+    ui_button(fb, (LCD_W - 140) / 2, 341, 140, 40, "Cancel", 2, white, 0x0000);
     ui_flush(fb);
 }
 
@@ -2467,7 +2605,7 @@ static void wifi_scan_screen(uint16_t *fb, char *out_ssid)
             if (has_list) {
                 for (int i = 0; i < show_n; i++) {
                     int ry = AP_LIST_Y + i * AP_ROW_H;
-                    if (ui_hit(tx, ty, 6, ry, 400, AP_ROW_H - 4)) {
+                    if (ui_hit(tx, ty, AP_LIST_X, ry, AP_LIST_W, AP_ROW_H)) {
                         esp_wifi_scan_stop();
                         esp_event_handler_unregister(WIFI_EVENT,
                                                      WIFI_EVENT_SCAN_DONE,
@@ -2547,8 +2685,8 @@ void app_main(void)
        WiFi handshake runs entirely in the background (lwIP / WPA2 stack tasks).
        We just check the event-group bit every 20 ms alongside the touch state.
        This adds zero latency to the connection. */
-    const int BTN_X = (LCD_W - 160) / 2, BTN_Y = LCD_H / 2 + 20;
-    const int BTN_W = 160, BTN_H = 44;
+    const int BTN_X = (LCD_W - 210) / 2, BTN_Y = LCD_H / 2 + 20;
+    const int BTN_W = 210, BTN_H = 44;
     s_tap_pending = false;
     for (;;) {
         if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)
@@ -2570,6 +2708,8 @@ void app_main(void)
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+
+    display_connected();   /* briefly shows "Connected!" until first video frame */
 
     uint8_t  *jpeg_buf = heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
     uint16_t *fb       = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
