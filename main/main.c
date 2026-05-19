@@ -856,7 +856,10 @@ static void af_task(void *arg)
                  req.lv_x, req.lv_y);
         ESP_LOGI(TAG, "touch AF → lv (%d,%d)", req.lv_x, req.lv_y);
         cam_get(url);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        /* OPC has no AF-only command. newstarttake always begins a full capture
+           sequence. Calling newstoptake immediately aborts it after AF but before
+           the shutter fires. 50 ms is enough for the AF result event to arrive. */
+        vTaskDelay(pdMS_TO_TICKS(50));
         cam_get("/exec_takemotion.cgi?com=newstoptake");
     }
 }
