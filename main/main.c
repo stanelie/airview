@@ -28,8 +28,6 @@
 
 /* ── Configuration ────────────────────────────────────────────────────────── */
 
-#define WIFI_SSID       "AIR-A01-BHC204544"
-#define WIFI_PASS       "33732272"
 #define CAM_IP          "192.168.0.10"
 #define LV_PORT         65001
 #define JPEG_BUF_SIZE   (256 * 1024)
@@ -167,8 +165,8 @@ static void channel_cache_save(uint8_t ch)
 
 static void wifi_creds_load(char *ssid, char *pass)
 {
-    strncpy(ssid, WIFI_SSID, 32); ssid[32] = '\0';
-    strncpy(pass, WIFI_PASS, 64); pass[64] = '\0';
+    ssid[0] = '\0';
+    pass[0] = '\0';
     nvs_handle_t h;
     if (nvs_open("airview", NVS_READONLY, &h) == ESP_OK) {
         size_t len = 33;
@@ -201,6 +199,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ESP_LOGW(TAG, "disconnected (reason %u), retrying", (unsigned)evt->reason);
         s_wifi_connected = false;
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        if (evt->reason == WIFI_REASON_NO_AP_FOUND) {
+            /* Targeted channel probe missed (often PHY settling after recal).
+               Clear the channel hint so the retry does a full scan. */
+            wifi_config_t cfg;
+            if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK) {
+                cfg.sta.channel = 0;
+                esp_wifi_set_config(WIFI_IF_STA, &cfg);
+            }
+        }
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
@@ -2678,6 +2685,18 @@ void app_main(void)
        the screen render takes ~30 ms so total is safely within the 1100 ms
        window before the first WPA2 handshake attempt. */
     display_splash();
+
+    /* If no credentials have ever been saved, skip straight to setup. */
+    {
+        char ssid_check[33] = {0}, pass_check[65] = {0};
+        wifi_creds_load(ssid_check, pass_check);
+        if (!ssid_check[0]) {
+            wifi_driver_init();
+            wifi_setup_flow();
+            esp_restart();
+        }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(150));
     wifi_begin_connecting();   /* non-blocking — STA_START fires connect */
 
