@@ -132,6 +132,29 @@ static QueueHandle_t s_prop_queue = NULL;
 
 static int s_selected_field = -1;   /* -1=none, 0=shutter, 1=aperture, 2=ISO, 3=exprev */
 
+/* ── WiFi channel cache ───────────────────────────────────────────────────── */
+
+static uint8_t channel_cache_load(void)
+{
+    nvs_handle_t h;
+    uint8_t ch = 0;
+    if (nvs_open("airview", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, "wifi_ch", &ch);
+        nvs_close(h);
+    }
+    return ch;
+}
+
+static void channel_cache_save(uint8_t ch)
+{
+    nvs_handle_t h;
+    if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "wifi_ch", ch);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* ── WiFi ─────────────────────────────────────────────────────────────────── */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -147,6 +170,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+        uint8_t primary; wifi_second_chan_t second;
+        if (esp_wifi_get_channel(&primary, &second) == ESP_OK && primary != 0) {
+            channel_cache_save(primary);
+            ESP_LOGI(TAG, "cached wifi channel %u", primary);
+        }
         s_wifi_connected = true;
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
@@ -170,11 +198,16 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                wifi_event_handler, NULL));
 
+    uint8_t cached_ch = channel_cache_load();
+    if (cached_ch) {
+        ESP_LOGI(TAG, "trying cached wifi channel %u first", cached_ch);
+    }
     wifi_config_t wifi_cfg = {
         .sta = {
             .ssid           = WIFI_SSID,
             .password       = WIFI_PASS,
             .scan_method    = WIFI_FAST_SCAN,
+            .channel        = cached_ch,   /* 0 = scan all; non-zero = try this first */
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
@@ -611,6 +644,30 @@ static void build_exprev_list(void)
     ESP_LOGI(TAG, "EXPREV: %d entries", s_exprev_cam_n);
 }
 
+/* Fire-and-forget cam_set_prop: spawns a task so liveview_loop is never blocked
+   by the camera's HTTP server going silent during/after a mode change. */
+typedef struct { char name[32]; char value[32]; } prop_set_req_t;
+
+static void prop_set_task(void *arg)
+{
+    prop_set_req_t *req = (prop_set_req_t *)arg;
+    cam_set_prop(req->name, req->value);
+    free(req);
+    vTaskDelete(NULL);
+}
+
+static void cam_set_prop_async(const char *name, const char *value)
+{
+    prop_set_req_t *req = malloc(sizeof(*req));
+    if (!req) { ESP_LOGE(TAG, "cam_set_prop_async: alloc failed"); return; }
+    strlcpy(req->name,  name,  sizeof(req->name));
+    strlcpy(req->value, value, sizeof(req->value));
+    if (xTaskCreate(prop_set_task, "prop_set", 3072, req, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "cam_set_prop_async: task failed");
+        free(req);
+    }
+}
+
 /* field: 0=shutter, 1=aperture, 2=ISO, 3=exprev; mode: 0=P,1=A,2=S,3=M,4=iA */
 static bool field_selectable(int field, int mode)
 {
@@ -659,9 +716,9 @@ static void adjust_field(int field, int delta)
         if (idx >= n) idx = n - 1;
         ESP_LOGI(TAG, "shutspeed: cur=%ld/%ld → %s",
                  (long)s_osd.shutter_num, (long)s_osd.shutter_denom, s_shutter_cam[idx].str);
-        cam_set_prop("SHUTTER", s_shutter_cam[idx].str);
         s_osd.shutter_num   = s_shutter_cam[idx].num;
         s_osd.shutter_denom = s_shutter_cam[idx].denom;
+        cam_set_prop_async("SHUTTER", s_shutter_cam[idx].str);
 
     } else if (field == 1) {
         int n = s_fnum_cam_n;
@@ -689,8 +746,8 @@ static void adjust_field(int field, int delta)
         if (idx < 0) idx = 0;
         if (idx >= n) idx = n - 1;
         ESP_LOGI(TAG, "focalvalue: cur_x10=%ld → %s", (long)s_osd.fnum_x10, s_fnum_cam[idx].str);
-        cam_set_prop("APERTURE", s_fnum_cam[idx].str);
         s_osd.fnum_x10 = s_fnum_cam[idx].x10;
+        cam_set_prop_async("APERTURE", s_fnum_cam[idx].str);
 
     } else if (field == 2) {
         int n = s_iso_cam_n;
@@ -718,8 +775,8 @@ static void adjust_field(int field, int delta)
         if (idx < 0) idx = 0;
         if (idx >= n) idx = n - 1;
         ESP_LOGI(TAG, "isospeedvalue: cur=%ld → %s", (long)s_osd.iso, s_iso_cam[idx].str);
-        cam_set_prop("ISO", s_iso_cam[idx].str);
         s_osd.iso = s_iso_cam[idx].val;
+        cam_set_prop_async("ISO", s_iso_cam[idx].str);
 
     } else if (field == 3) {
         int n = s_exprev_cam_n;
@@ -730,8 +787,8 @@ static void adjust_field(int field, int delta)
         if (idx >= n) idx = n - 1;
         ESP_LOGI(TAG, "exprev: %s → %s",
                  s_exprev_cam[s_exprev_idx].str, s_exprev_cam[idx].str);
-        cam_set_prop("EXPREV", s_exprev_cam[idx].str);
         s_exprev_idx = idx;
+        cam_set_prop_async("EXPREV", s_exprev_cam[idx].str);
     }
 }
 
@@ -856,6 +913,33 @@ static void af_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(300));
         cam_get("/exec_takemotion.cgi?com=newstoptake");
     }
+}
+
+static void init_props_task(void *arg)
+{
+    build_wb_list();
+    char wb_val[20] = {0};
+    if (cam_get_prop("WB", wb_val, sizeof(wb_val))) {
+        for (int i = 0; i < s_wb_cam_n; i++) {
+            if (strcmp(wb_val, s_wb_cam[i].api) == 0) { s_wb_idx = i; break; }
+        }
+    }
+
+    build_exprev_list();
+    char exprev_val[12] = {0};
+    if (cam_get_prop("EXPREV", exprev_val, sizeof(exprev_val))) {
+        for (int i = 0; i < s_exprev_cam_n; i++) {
+            if (strcmp(exprev_val, s_exprev_cam[i].str) == 0) { s_exprev_idx = i; break; }
+        }
+    }
+
+    char batt_val[12] = {0};
+    if (cam_get_prop("BATTERY_LEVEL", batt_val, sizeof(batt_val)))
+        set_battery_str(batt_val);
+
+    build_prop_lists();
+
+    vTaskDelete(NULL);
 }
 
 /* Drains s_prop_queue and calls refresh_prop with a minimum gap between
@@ -1690,9 +1774,10 @@ restart:;
     if (!s_pushevent_started) {
         s_pushevent_started = true;
         s_prop_queue = xQueueCreate(8, PROP_NAME_MAX);
-        xTaskCreate(prop_refresh_task, "prop_ref",  4096, NULL, 3, NULL);
-        xTaskCreate(pushevent_task,    "pushevent", 4096, NULL, 4, NULL);
-        xTaskCreate(battery_task,      "battery",   4096, NULL, 3, NULL);
+        xTaskCreate(init_props_task,   "init_props", 4096, NULL, 3, NULL);
+        xTaskCreate(prop_refresh_task, "prop_ref",   4096, NULL, 3, NULL);
+        xTaskCreate(pushevent_task,    "pushevent",  4096, NULL, 4, NULL);
+        xTaskCreate(battery_task,      "battery",    4096, NULL, 3, NULL);
         s_af_queue = xQueueCreate(1, sizeof(af_req_t));
         xTaskCreate(af_task, "touch_af", 4096, NULL, 4, NULL);
     }
@@ -1780,7 +1865,7 @@ restart:;
                     /* Mode indicator — top black bar (text y=12–36) */
                     s_shoot_mode = (s_shoot_mode + 1) % NUM_MODES;
                     ESP_LOGI(TAG, "shoot mode → %s", s_mode_display[s_shoot_mode]);
-                    cam_set_prop("TAKEMODE", s_mode_api[s_shoot_mode]);
+                    cam_set_prop_async("TAKEMODE", s_mode_api[s_shoot_mode]);
                     /* Do NOT call build_prop_lists() here: the camera's HTTP server
                        goes offline for several seconds after a mode change, and
                        the value lists loaded at startup remain valid across modes. */
@@ -1799,7 +1884,7 @@ restart:;
                         s_wb_idx = (s_wb_idx + 1) % s_wb_cam_n;
                         ESP_LOGI(TAG, "WB → %s (%s)", s_wb_cam[s_wb_idx].label,
                                  s_wb_cam[s_wb_idx].api);
-                        cam_set_prop("WB", s_wb_cam[s_wb_idx].api);
+                        cam_set_prop_async("WB", s_wb_cam[s_wb_idx].api);
                     }
                 } else if (ty >= 324) {
                     /* OSD strip (text y=340–356, +one row above): shutter/exprev/aperture */
@@ -1879,52 +1964,6 @@ void app_main(void)
     display_splash();
 
     wifi_init();
-    cam_get("/get_connectmode.cgi");
-    cam_get("/switch_cameramode.cgi?mode=rec");
-
-    /* Read current shooting mode from camera */
-    char mode_val[8] = "P";
-    if (cam_get_prop("TAKEMODE", mode_val, sizeof(mode_val))) {
-        for (int i = 0; i < NUM_MODES; i++) {
-            if (strcmp(mode_val, s_mode_api[i]) == 0) {
-                s_shoot_mode = i;
-                break;
-            }
-        }
-    }
-    ESP_LOGI(TAG, "shoot mode: %s", s_mode_display[s_shoot_mode]);
-
-    /* Fetch camera's WB value list and read current WB */
-    build_wb_list();
-    char wb_val[20] = {0};
-    if (cam_get_prop("WB", wb_val, sizeof(wb_val))) {
-        for (int i = 0; i < s_wb_cam_n; i++) {
-            if (strcmp(wb_val, s_wb_cam[i].api) == 0) { s_wb_idx = i; break; }
-        }
-    }
-    ESP_LOGI(TAG, "WB current: %s", s_wb_cam_n > 0 ? s_wb_cam[s_wb_idx].label : "?");
-
-    /* Fetch camera's EXPREV value list and read current value */
-    build_exprev_list();
-    char exprev_val[12] = {0};
-    if (cam_get_prop("EXPREV", exprev_val, sizeof(exprev_val))) {
-        for (int i = 0; i < s_exprev_cam_n; i++) {
-            if (strcmp(exprev_val, s_exprev_cam[i].str) == 0) { s_exprev_idx = i; break; }
-        }
-        ESP_LOGI(TAG, "EXPREV current: %s", exprev_val);
-    }
-
-    /* Read current battery level */
-    {
-        char batt_val[12] = {0};
-        if (cam_get_prop("BATTERY_LEVEL", batt_val, sizeof(batt_val))) {
-            set_battery_str(batt_val);
-            ESP_LOGI(TAG, "BATTERY_LEVEL: %s → %s", batt_val, s_battery_str);
-        }
-    }
-
-    /* Query camera's permitted value lists for adjustable properties */
-    build_prop_lists();
 
     uint8_t  *jpeg_buf = heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM);
     uint16_t *fb       = heap_caps_malloc((size_t)LCD_W * LCD_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
