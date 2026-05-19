@@ -2697,7 +2697,7 @@ void app_main(void)
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(250));
     wifi_begin_connecting();   /* non-blocking — STA_START fires connect */
 
     /* ── Connecting-screen poll loop.
