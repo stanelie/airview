@@ -124,7 +124,10 @@ static int32_t s_af_lv_x  = 0, s_af_lv_y = 0;
 static int32_t s_af_lv_w  = 0, s_af_lv_h = 0;
 
 typedef struct { int lv_x, lv_y; } af_req_t;
-static QueueHandle_t s_af_queue = NULL;
+static QueueHandle_t s_af_queue   = NULL;
+
+#define PROP_NAME_MAX 32
+static QueueHandle_t s_prop_queue = NULL;
 
 
 static int s_selected_field = -1;   /* -1=none, 0=shutter, 1=aperture, 2=ISO, 3=exprev */
@@ -199,13 +202,31 @@ static esp_err_t http_evt(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/* Minimum gap between any two HTTP calls. The camera's embedded server
+   cannot handle rapid-fire connections and stops responding after a burst. */
+#define HTTP_MIN_GAP_MS 150
+
+static int64_t s_http_last_us = 0;
+
+/* Enforce minimum inter-call gap. Caller must hold s_http_mutex. */
+static void http_throttle(void)
+{
+    if (s_http_last_us) {
+        int64_t wait_us = (HTTP_MIN_GAP_MS * 1000LL) - (esp_timer_get_time() - s_http_last_us);
+        if (wait_us > 0)
+            vTaskDelay(pdMS_TO_TICKS(wait_us / 1000 + 1));
+    }
+}
+
 /* Internal GET — caller must hold s_http_mutex */
 static int cam_get_impl(const char *path)
 {
+    http_throttle();
+
     char url[256];
     snprintf(url, sizeof(url), "http://%s%s", CAM_IP, path);
     esp_http_client_config_t cfg = {
-        .url = url, .event_handler = http_evt, .timeout_ms = 5000,
+        .url = url, .event_handler = http_evt, .timeout_ms = 2000,
     };
     s_resp[0] = '\0';
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
@@ -220,6 +241,8 @@ static int cam_get_impl(const char *path)
         ESP_LOGE(TAG, "GET %s failed: %s", path, esp_err_to_name(err));
     }
     esp_http_client_cleanup(c);
+
+    s_http_last_us = esp_timer_get_time();
     return status;
 }
 
@@ -273,9 +296,10 @@ static bool cam_set_prop(const char *name, const char *value)
         .url            = url,
         .method         = HTTP_METHOD_POST,
         .event_handler  = http_evt,
-        .timeout_ms     = 5000,
+        .timeout_ms     = 2000,
     };
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    http_throttle();
     s_resp[0] = '\0';
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     esp_http_client_set_header(c, "User-Agent", "OlympusCameraKit");
@@ -291,6 +315,7 @@ static bool cam_set_prop(const char *name, const char *value)
         ESP_LOGE(TAG, "set %s failed: %s", name, esp_err_to_name(err));
     }
     esp_http_client_cleanup(c);
+    s_http_last_us = esp_timer_get_time();
     xSemaphoreGive(s_http_mutex);
     return (status == 200 || status == 520);
 }
@@ -637,10 +662,6 @@ static void adjust_field(int field, int delta)
         cam_set_prop("SHUTTER", s_shutter_cam[idx].str);
         s_osd.shutter_num   = s_shutter_cam[idx].num;
         s_osd.shutter_denom = s_shutter_cam[idx].denom;
-        /* Readback: verify the camera accepted the new value */
-        { char rb[16] = {0}; if (cam_get_prop("SHUTTER", rb, sizeof(rb)))
-            ESP_LOGI(TAG, "SHUTTER readback: %s", rb);
-        }
 
     } else if (field == 1) {
         int n = s_fnum_cam_n;
@@ -670,10 +691,6 @@ static void adjust_field(int field, int delta)
         ESP_LOGI(TAG, "focalvalue: cur_x10=%ld → %s", (long)s_osd.fnum_x10, s_fnum_cam[idx].str);
         cam_set_prop("APERTURE", s_fnum_cam[idx].str);
         s_osd.fnum_x10 = s_fnum_cam[idx].x10;
-        /* Readback: verify the camera accepted the new value */
-        { char rb[16] = {0}; if (cam_get_prop("APERTURE", rb, sizeof(rb)))
-            ESP_LOGI(TAG, "APERTURE readback: %s", rb);
-        }
 
     } else if (field == 2) {
         int n = s_iso_cam_n;
@@ -703,10 +720,6 @@ static void adjust_field(int field, int delta)
         ESP_LOGI(TAG, "isospeedvalue: cur=%ld → %s", (long)s_osd.iso, s_iso_cam[idx].str);
         cam_set_prop("ISO", s_iso_cam[idx].str);
         s_osd.iso = s_iso_cam[idx].val;
-        /* Readback: verify the camera accepted the new value */
-        { char rb[12] = {0}; if (cam_get_prop("ISO", rb, sizeof(rb)))
-            ESP_LOGI(TAG, "ISO readback: %s", rb);
-        }
 
     } else if (field == 3) {
         int n = s_exprev_cam_n;
@@ -719,10 +732,6 @@ static void adjust_field(int field, int delta)
                  s_exprev_cam[s_exprev_idx].str, s_exprev_cam[idx].str);
         cam_set_prop("EXPREV", s_exprev_cam[idx].str);
         s_exprev_idx = idx;
-        /* Readback: verify the camera accepted the new value */
-        { char rb[12] = {0}; if (cam_get_prop("EXPREV", rb, sizeof(rb)))
-            ESP_LOGI(TAG, "EXPREV readback: %s", rb);
-        }
     }
 }
 
@@ -849,6 +858,17 @@ static void af_task(void *arg)
     }
 }
 
+/* Drains s_prop_queue and calls refresh_prop with a minimum gap between
+   HTTP calls so the camera's embedded server isn't overwhelmed. */
+static void prop_refresh_task(void *arg)
+{
+    char prop[PROP_NAME_MAX];
+    for (;;) {
+        if (xQueueReceive(s_prop_queue, prop, portMAX_DELAY) == pdTRUE)
+            refresh_prop(prop);
+    }
+}
+
 static void pushevent_task(void *arg)
 {
     char path[64];
@@ -936,11 +956,11 @@ restart:;
                 p += 6;
                 const char *end = strstr(p, "</prop>");
                 if (end) {
-                    char prop[32] = {0};
+                    char prop[PROP_NAME_MAX] = {0};
                     int n = (int)(end - p);
-                    if (n > 0 && n < (int)sizeof(prop)) {
+                    if (n > 0 && n < PROP_NAME_MAX && s_prop_queue) {
                         memcpy(prop, p, n);
-                        refresh_prop(prop);
+                        xQueueSend(s_prop_queue, prop, 0); /* drop if full */
                     }
                 }
             }
@@ -1669,8 +1689,10 @@ restart:;
     static bool s_pushevent_started = false;
     if (!s_pushevent_started) {
         s_pushevent_started = true;
-        xTaskCreate(pushevent_task, "pushevent", 4096, NULL, 4, NULL);
-        xTaskCreate(battery_task,   "battery",   4096, NULL, 3, NULL);
+        s_prop_queue = xQueueCreate(8, PROP_NAME_MAX);
+        xTaskCreate(prop_refresh_task, "prop_ref",  4096, NULL, 3, NULL);
+        xTaskCreate(pushevent_task,    "pushevent", 4096, NULL, 4, NULL);
+        xTaskCreate(battery_task,      "battery",   4096, NULL, 3, NULL);
         s_af_queue = xQueueCreate(1, sizeof(af_req_t));
         xTaskCreate(af_task, "touch_af", 4096, NULL, 4, NULL);
     }
@@ -1759,7 +1781,9 @@ restart:;
                     s_shoot_mode = (s_shoot_mode + 1) % NUM_MODES;
                     ESP_LOGI(TAG, "shoot mode → %s", s_mode_display[s_shoot_mode]);
                     cam_set_prop("TAKEMODE", s_mode_api[s_shoot_mode]);
-                    build_prop_lists();
+                    /* Do NOT call build_prop_lists() here: the camera's HTTP server
+                       goes offline for several seconds after a mode change, and
+                       the value lists loaded at startup remain valid across modes. */
                     if (s_selected_field >= 0 &&
                         !field_selectable(s_selected_field, s_shoot_mode))
                         s_selected_field = -1;
