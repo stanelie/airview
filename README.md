@@ -2,18 +2,23 @@
 
 An electronic viewfinder (EVF) for the Olympus Air A01 lens camera, built on an ESP32-S3 with a round 412×412 display. Connect it to the camera's Wi-Fi AP and it streams a live JPEG view with a full shooting control overlay — shutter, aperture, ISO, exposure compensation, white balance, and shooting mode — all controllable by touch.
 
+Created with Claude Code.
+
+<img width="300" height="400" alt="20260519_163848" src="https://github.com/user-attachments/assets/b8a86da3-a076-44b3-8034-e153795243a7" />
+
+
 ## Hardware
 
 | Part | Details |
 |------|---------|
-| Board | Waveshare ESP32-S3-Touch-LCD-1.46 |
+| Board | Waveshare ESP32-S3-Touch-LCD-1.46 https://www.waveshare.com/esp32-s3-touch-lcd-1.46b.htm |
 | Display | SPD2010, 412×412, round, SPI @ 80 MHz |
 | SoC | ESP32-S3 (dual-core, 240 MHz, 8 MB PSRAM) |
 | Flash | 16 MB QIO |
 
 ## Features
 
-- **Live view** — streams 320×240 JPEG frames from the camera over UDP (RTP), decoded with TJpgDec and upscaled to fill the round display
+- **Live view** — streams 320×240 JPEG frames from the camera over UDP (RTP), decoded with TJpgDec and upscaled to fill the round display, about 110 FPS
 - **Touch OSD** — tap any readout to cycle its value; fields dim automatically when the current shooting mode makes them irrelevant
 - **Shooting modes** — cycle P / A / S / M / iA from the mode indicator
 - **Exposure controls** — shutter speed, aperture, ISO, exposure compensation
@@ -70,7 +75,3 @@ main/
   exio/               TCA9554 GPIO expander
   tjpgd/              TJpgDec JPEG decoder
 ```
-
-## Camera compatibility
-
-Tested against the Olympus Air A01 using the OPC (Olympus Open Platform Camera) HTTP API. The device sets `User-Agent: OlympusCameraKit` on all requests and communicates over the camera's own Wi-Fi AP at `192.168.0.10`.
