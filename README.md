@@ -18,16 +18,14 @@ Created with Claude Code.
 
 ## Features
 
-- **Live view** — streams 320×240 JPEG frames from the camera over UDP (RTP), decoded with TJpgDec and upscaled to fill the round display, about 110 FPS
-- **Touch OSD** — tap any readout to cycle its value; fields dim automatically when the current shooting mode makes them irrelevant
+- **Live view** — streams 320×240 JPEG frames at about 10 FPS from the camera over UDP (RTP), decoded with TJpgDec and upscaled to fill the round display
+- **Touch OSD** — tap a button to select it, tap on right side of the image to increase value, left side of image to decrease value
 - **Shooting modes** — cycle P / A / S / M / iA from the mode indicator
 - **Exposure controls** — shutter speed, aperture, ISO, exposure compensation
 - **White balance** — AWB, Sunny, Shade, Cloudy, Tungsten, Fluorescent, Underwater, Custom
-- **AF box** — real-time autofocus target drawn over the live view (green = locked, red = failed)
-- **Battery indicator** — live level pulled from the camera (FULL / MED / LOW / WARN / CHRG)
-- **Display modes** — fill-width (letterboxed) or 1:1 centred
-- **Wi-Fi setup UI** — on-device AP scanner and touch keyboard; credentials stored in NVS, never compiled in
-- **Channel cache** — remembers the last connected channel so subsequent boots skip the full scan
+- **Tap to focus** — real-time autofocus target drawn over the live view (green box)
+- **Battery indicator** — live level pulled from the camera
+- **Wi-Fi setup UI** — on-device AP scanner and touch keyboard; credentials stored in non-volatile memory
 
 ## Building
 
