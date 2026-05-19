@@ -576,8 +576,8 @@ static void build_exprev_list(void)
     if (s_exprev_cam_n == 0) {
         static const char *fb[] = {
             "-3.0","-2.7","-2.3","-2.0","-1.7","-1.3","-1.0","-0.7","-0.3",
-            "+0.0",
-            "+0.3","+0.7","+1.0","+1.3","+1.7","+2.0","+2.7","+3.0",
+            "0.0",
+            "+0.3","+0.7","+1.0","+1.3","+1.7","+2.0","+2.3","+2.7","+3.0",
         };
         for (int i = 0; i < (int)(sizeof(fb)/sizeof(fb[0])) && s_exprev_cam_n < EXPREV_CAM_MAX; i++) {
             strncpy(s_exprev_cam[s_exprev_cam_n].str, fb[i],
@@ -863,13 +863,7 @@ static void af_task(void *arg)
 
 static void init_props_task(void *arg)
 {
-    build_exprev_list();
-    char exprev_val[12] = {0};
-    if (cam_get_prop("EXPREV", exprev_val, sizeof(exprev_val))) {
-        for (int i = 0; i < s_exprev_cam_n; i++) {
-            if (strcmp(exprev_val, s_exprev_cam[i].str) == 0) { s_exprev_idx = i; break; }
-        }
-    }
+    build_exprev_list();   /* populates s_exprev_cam for adjustment; current idx comes from RTP ext */
 
     char batt_val[12] = {0};
     if (cam_get_prop("BATTERY_LEVEL", batt_val, sizeof(batt_val)))
@@ -1274,6 +1268,17 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
         case 12: /* isospeedvalue: cur_iso, auto_flag, ext_warning */
             if (field_words >= 1) {
                 s_osd.iso = be32s(p);
+            }
+            break;
+        case 10:  /* exprev: [max×10, min×10, cur×10] */
+            if (field_words >= 3) {
+                int32_t tenth = be32s(p + 8);
+                for (int i = 0; i < s_exprev_cam_n; i++) {
+                    if ((int32_t)lroundf(atof(s_exprev_cam[i].str) * 10.0f) == tenth) {
+                        s_exprev_idx = i;
+                        break;
+                    }
+                }
             }
             break;
         case 107:
