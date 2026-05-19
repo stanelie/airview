@@ -1402,16 +1402,30 @@ static void draw_osd_bottom(uint16_t *fb)
     const int gap        = scale;
     const int y0         = 340;
     /* Three fields: shutter (103), exprev (206), aperture (309). */
-    const int centers[3]    = {103, 206, 309};
+    const int centers[3]    = {115, 206, 306};
     const char *strs[3]     = {shutter_str, exprev_str, fnum_str};
     const int field_ids[3]  = {0, 3, 1};
 
-    for (int i = 0; i < 3; i++) {
-        int fid    = field_ids[i];
-        int len    = (int)strlen(strs[i]);
-        int text_w = len * cw + (len > 1 ? (len - 1) * gap : 0);
-        draw_osd_text(fb, centers[i] - text_w / 2, y0, scale, strs[i],
-                      (fid == s_selected_field), field_selectable(fid, s_shoot_mode), 0);
+    /* Compute the circular display's x bounds at y0 so boxes stay visible. */
+    {
+        const int cc = LCD_W / 2, rc = LCD_W / 2 - 8;
+        int dy  = y0 - LCD_H / 2;
+        int dx2 = rc * rc - dy * dy;
+        int dx  = (dx2 > 0) ? (int)sqrtf((float)dx2) : 0;
+        int x_lo = cc - dx;   /* leftmost visible pixel at y0 */
+        int x_hi = cc + dx;   /* rightmost visible pixel at y0 */
+
+        for (int i = 0; i < 3; i++) {
+            int fid    = field_ids[i];
+            int len    = (int)strlen(strs[i]);
+            int text_w = len * cw + (len > 1 ? (len - 1) * gap : 0);
+            int x0     = centers[i] - text_w / 2;
+            /* Clamp so the 3 px box padding stays within the circle. */
+            if (x0 - 3 < x_lo)               x0 = x_lo + 3;
+            if (x0 + text_w + 3 > x_hi)      x0 = x_hi - text_w - 3;
+            draw_osd_text(fb, x0, y0, scale, strs[i],
+                          (fid == s_selected_field), field_selectable(fid, s_shoot_mode), 0);
+        }
     }
 }
 
