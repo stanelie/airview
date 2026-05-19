@@ -87,6 +87,7 @@ static int          s_exprev_cam_n = 0;
 static int          s_exprev_idx   = 0;
 
 static char s_battery_str[8] = "---";
+static bool s_charging        = false;
 
 static volatile bool  s_tap_pending = false;
 static volatile uint16_t s_tap_x   = 0;
@@ -768,9 +769,20 @@ static void parse_focalvalue_str(const char *val)
 
 static void set_battery_str(const char *val)
 {
-    /* Strip "SUPPLY_" prefix (camera on external power) then remap known labels */
-    const char *label = (strncmp(val, "SUPPLY_", 7) == 0) ? val + 7 : val;
-    if (strcmp(label, "WARNING") == 0) label = "LOW";
+    s_charging = false;
+    const char *label = val;
+
+    if      (strcmp(val, "FULL")         == 0) { label = "FULL"; }
+    else if (strcmp(val, "LOW")          == 0) { label = "LOW"; }
+    else if (strcmp(val, "WARNING")      == 0) { label = "WARN"; }
+    else if (strcmp(val, "EMPTY")        == 0) { label = "EMPTY"; }
+    else if (strcmp(val, "UNKNOWN")      == 0) { label = "UNK"; }
+    else if (strcmp(val, "CHARGE")       == 0) { label = "CHRG";  s_charging = true; }
+    else if (strcmp(val, "EMPTY_AC")     == 0) { label = "EMPTY"; s_charging = true; }
+    else if (strcmp(val, "SUPPLY_FULL")  == 0) { label = "FULL";  s_charging = true; }
+    else if (strcmp(val, "SUPPLY_LOW")   == 0) { label = "LOW";   s_charging = true; }
+    else if (strcmp(val, "SUPPLY_WARNING")== 0){ label = "WARN";  s_charging = true; }
+
     strncpy(s_battery_str, label, sizeof(s_battery_str) - 1);
     s_battery_str[sizeof(s_battery_str) - 1] = '\0';
 }
@@ -814,8 +826,10 @@ static void battery_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(60000));
         char bv[12] = {0};
-        if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv)))
+        if (cam_get_prop("BATTERY_LEVEL", bv, sizeof(bv))) {
             set_battery_str(bv);
+            ESP_LOGI(TAG, "BATTERY_LEVEL: %s → %s", bv, s_battery_str);
+        }
     }
 }
 
@@ -1234,10 +1248,10 @@ static void parse_rtp_ext(const uint8_t *ext_hdr, int ext_words)
 
 /* Draw text into the framebuffer at (x0, y0) at given scale.
    inverted=true swaps colors (white bg, black text) to indicate selection. */
-static void draw_osd_text(uint16_t *fb, int x0, int y0, int scale, const char *text, bool inverted, bool editable)
+static void draw_osd_text(uint16_t *fb, int x0, int y0, int scale, const char *text, bool inverted, bool editable, uint16_t fg_color)
 {
     const uint16_t bg    = inverted ? 0xFFFF : 0x0000;
-    const uint16_t fg    = inverted ? 0x0000 : 0xFFFF;
+    const uint16_t fg    = fg_color ? fg_color : (inverted ? 0x0000 : 0xFFFF);
     const uint16_t green = __builtin_bswap16(0x07E0);
 
     int len = 0;
@@ -1347,7 +1361,7 @@ static void draw_osd_bottom(uint16_t *fb)
         int len    = (int)strlen(strs[i]);
         int text_w = len * cw + (len > 1 ? (len - 1) * gap : 0);
         draw_osd_text(fb, centers[i] - text_w / 2, y0, scale, strs[i],
-                      (fid == s_selected_field), field_selectable(fid, s_shoot_mode));
+                      (fid == s_selected_field), field_selectable(fid, s_shoot_mode), 0);
     }
 }
 
@@ -1525,14 +1539,34 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         const char *mtxt = s_mode_display[s_shoot_mode];
         int mlen = (int)strlen(mtxt);
         int mw   = mlen * (8 * 3) + (mlen > 1 ? (mlen - 1) * 3 : 0);
-        draw_osd_text(fb, (LCD_W - mw) / 2 - 24, 12, 3, mtxt, false, false);
+        draw_osd_text(fb, (LCD_W - mw) / 2 - 24, 12, 3, mtxt, false, false, 0);
 
         /* Battery level — right-justified to a fixed right edge so it never moves */
         if (s_battery_str[0] && s_battery_str[0] != '-') {
-            int blen      = (int)strlen(s_battery_str);
-            int bw        = blen * (8 * 2) + (blen > 1 ? (blen - 1) * 2 : 0);
-            int batt_right = (LCD_W + max_mw) / 2 + 60; /* fixed, past outline right edge */
-            draw_osd_text(fb, batt_right - bw, 20, 2, s_battery_str, false, false);
+            int blen       = (int)strlen(s_battery_str);
+            int bw         = blen * (8 * 2) + (blen > 1 ? (blen - 1) * 2 : 0);
+            int batt_right = (LCD_W + max_mw) / 2 + 60;
+
+            /* Pick base color by level */
+            uint16_t base_clr;
+            if (strcmp(s_battery_str, "FULL") == 0 || strcmp(s_battery_str, "CHRG") == 0)
+                base_clr = __builtin_bswap16(0x07E0);        /* green  */
+            else if (strcmp(s_battery_str, "LOW") == 0)
+                base_clr = __builtin_bswap16(0xFD20);        /* orange */
+            else
+                base_clr = __builtin_bswap16(0xF800);        /* red (WARN, EMPTY, UNK) */
+
+            uint16_t batt_clr = base_clr;
+            bool blink_phase = (esp_timer_get_time() / 500000ULL) & 1;
+            if (s_charging) {
+                /* Charging: blink between base color and green at 1 Hz */
+                batt_clr = blink_phase ? __builtin_bswap16(0x07E0) : base_clr;
+            } else if (strcmp(s_battery_str, "WARN") == 0) {
+                /* Warning: blink red on/off at 1 Hz */
+                batt_clr = blink_phase ? base_clr : 0x0000;
+            }
+
+            draw_osd_text(fb, batt_right - bw, 20, 2, s_battery_str, false, false, batt_clr);
         }
 
         /* Fixed-size 2px green outline around mode tap zone — sized to the widest mode ("iA")
@@ -1567,14 +1601,14 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         int ilen = (int)strlen(iso_str);
         int iw   = ilen * (8 * 2) + (ilen > 1 ? (ilen - 1) * 2 : 0);
         draw_osd_text(fb, 103 - iw / 2, 58, 2, iso_str, (s_selected_field == 2),
-                      field_selectable(2, s_shoot_mode));
+                      field_selectable(2, s_shoot_mode), 0);
     }
     /* OSD: white balance — top-right column (same x-centre as aperture, 309) */
     {
         const char *wbtxt = (s_wb_cam_n > 0) ? s_wb_cam[s_wb_idx].label : "---";
         int wblen = (int)strlen(wbtxt);
         int wbw   = wblen * (8 * 2) + (wblen > 1 ? (wblen - 1) * 2 : 0);
-        draw_osd_text(fb, 309 - wbw / 2, 58, 2, wbtxt, false, (s_shoot_mode != 4));
+        draw_osd_text(fb, 309 - wbw / 2, 58, 2, wbtxt, false, (s_shoot_mode != 4), 0);
     }
     /* OSD: shutter / aperture — spread at bottom */
     draw_osd_bottom(fb);
