@@ -74,10 +74,18 @@ static const char *s_mode_api[]     = {"P", "A", "S", "M", "iAuto"};
 
 static int            s_shoot_mode  = 0;
 
-#define WB_CAM_MAX 32
-typedef struct { char api[20]; char label[8]; } wb_cam_t;
-static wb_cam_t s_wb_cam[WB_CAM_MAX];
-static int      s_wb_cam_n = 0;
+typedef struct { const char *api; const char *label; } wb_cam_t;
+static const wb_cam_t s_wb_cam[] = {
+    {"WB_AUTO",           "AWB"},
+    {"MWB_FINE",          "SUN"},
+    {"MWB_SHADE",         "SHADE"},
+    {"MWB_CLOUD",         "CLOUD"},
+    {"MWB_LAMP",          "TUNG"},
+    {"MWB_FLUORESCENCE1", "FLUO"},
+    {"MWB_WATER_1",       "WATER"},
+    {"WB_CUSTOM1",        "CUSTM"},
+};
+static const int s_wb_cam_n = (int)(sizeof(s_wb_cam) / sizeof(s_wb_cam[0]));
 static int      s_wb_idx   = 0;
 
 #define EXPREV_CAM_MAX 32
@@ -546,68 +554,6 @@ static void build_prop_lists(void)
     ESP_LOGI(TAG, "isospeedvalue: %d entries", s_iso_cam_n);
 }
 
-static void build_wb_list(void)
-{
-    static const struct { const char *api; const char *lbl; } map[] = {
-        {"WB_AUTO",           "AWB"},
-        {"MWB_FINE",          "SUN"},   {"WB_FINE",     "SUN"},
-        {"MWB_SHADE",         "SHADE"}, {"WB_SHADE",    "SHADE"},
-        {"MWB_CLOUD",         "CLOUD"}, {"WB_CLOUD",    "CLOUD"},
-        {"MWB_LAMP",          "TUNG"},  {"WB_LAMP",     "TUNG"},
-        {"MWB_FLUORESCENCE1", "FLUO"},  {"WB_FLUORESCENT1","FLUO"},
-        {"MWB_FLUORESCENCE2", "FLUO2"}, {"WB_FLUORESCENT2","FLUO2"},
-        {"MWB_FLUORESCENCE3", "FLUO3"}, {"WB_FLUORESCENT3","FLUO3"},
-        {"MWB_FLUORESCENCE4", "FLUO4"}, {"WB_FLUORESCENT4","FLUO4"},
-        {"MWB_WATER_1",       "WATER"}, {"MWB_WATER_2", "WATR2"},
-        {"WB_CUSTOM1",        "CUSTM"}, {"WB_CUSTOM2",  "CST2"},
-        {"WB_CUSTOM3",        "CST3"},  {"WB_MWB",      "MWB"},
-        {"WB_FLASH",          "FLASH"},
-        {"MWB_3000","3000"},{"MWB_3300","3300"},{"MWB_4000","4000"},
-        {"MWB_4500","4500"},{"MWB_5000","5000"},{"MWB_5500","5500"},
-        {"MWB_6000","6000"},{"MWB_6500","6500"},{"MWB_7500","7500"},
-    };
-    s_wb_cam_n = 0;
-
-    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-    int st = cam_get_impl("/get_camprop.cgi?com=desc&propname=WB");
-    if (st == 200 || st == 520) {
-        ESP_LOGI(TAG, "WB desc [%d]: %s", st, s_resp);
-        char tokens[WB_CAM_MAX][20];
-        int n = parse_enum_list(s_resp, tokens, WB_CAM_MAX);
-        for (int i = 0; i < n && s_wb_cam_n < WB_CAM_MAX; i++) {
-            wb_cam_t *v = &s_wb_cam[s_wb_cam_n++];
-            strncpy(v->api, tokens[i], sizeof(v->api) - 1);
-            v->api[sizeof(v->api) - 1] = '\0';
-            const char *lbl = NULL;
-            for (int j = 0; j < (int)(sizeof(map)/sizeof(map[0])); j++) {
-                if (strcmp(tokens[i], map[j].api) == 0) { lbl = map[j].lbl; break; }
-            }
-            if (lbl) {
-                strncpy(v->label, lbl, sizeof(v->label) - 1);
-            } else {
-                strncpy(v->label, tokens[i], sizeof(v->label) - 1);
-            }
-            v->label[sizeof(v->label) - 1] = '\0';
-        }
-    }
-    xSemaphoreGive(s_http_mutex);
-
-    if (s_wb_cam_n == 0) {
-        /* Fallback — populated after first readback reveals actual values */
-        static const struct { const char *api; const char *lbl; } fb[] = {
-            {"WB_AUTO", "AWB"},
-        };
-        for (int i = 0; i < (int)(sizeof(fb)/sizeof(fb[0])); i++) {
-            strncpy(s_wb_cam[i].api,   fb[i].api, sizeof(s_wb_cam[0].api)   - 1);
-            strncpy(s_wb_cam[i].label, fb[i].lbl, sizeof(s_wb_cam[0].label) - 1);
-        }
-        s_wb_cam_n = sizeof(fb)/sizeof(fb[0]);
-    }
-    if (s_wb_idx >= s_wb_cam_n) s_wb_idx = 0;
-    ESP_LOGI(TAG, "WB: %d entries", s_wb_cam_n);
-    for (int i = 0; i < s_wb_cam_n; i++)
-        ESP_LOGI(TAG, "  WB[%d] %s = %s", i, s_wb_cam[i].api, s_wb_cam[i].label);
-}
 
 static void build_exprev_list(void)
 {
@@ -917,14 +863,6 @@ static void af_task(void *arg)
 
 static void init_props_task(void *arg)
 {
-    build_wb_list();
-    char wb_val[20] = {0};
-    if (cam_get_prop("WB", wb_val, sizeof(wb_val))) {
-        for (int i = 0; i < s_wb_cam_n; i++) {
-            if (strcmp(wb_val, s_wb_cam[i].api) == 0) { s_wb_idx = i; break; }
-        }
-    }
-
     build_exprev_list();
     char exprev_val[12] = {0};
     if (cam_get_prop("EXPREV", exprev_val, sizeof(exprev_val))) {
