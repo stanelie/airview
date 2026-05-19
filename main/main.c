@@ -1340,7 +1340,7 @@ static void draw_osd_text(uint16_t *fb, int x0, int y0, int scale, const char *t
         }
     }
 
-    int cx = x0;
+    int cx = x0 + 3;
     for (int i = 0; i < len; i++) {
         uint8_t c = (uint8_t)text[i];
         if (c >= 0x20 && c < 0x80) {
