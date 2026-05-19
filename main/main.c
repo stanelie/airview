@@ -1128,7 +1128,7 @@ static void display_init(void)
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel    = LEDC_CHANNEL_0,
         .timer_sel  = LEDC_TIMER_0,
-        .duty       = 6553,
+        .duty       = 8191,
         .hpoint     = 0,
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_ch));
