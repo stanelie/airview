@@ -47,8 +47,6 @@
 
 ## Camera WiFi
 - Camera power: physical button on camera body starts WiFi AP automatically
-- SSID: AIR-A01-BHC204544
-- Password: 33732272
 - Camera IP: 192.168.0.10
 - No Bluetooth required
 
