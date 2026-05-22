@@ -160,7 +160,7 @@ static int32_t s_af_lv_x  = 0, s_af_lv_y = 0;
 static int32_t s_af_lv_w  = 0, s_af_lv_h = 0;
 
 typedef struct { int lv_x, lv_y; } af_req_t;
-static QueueHandle_t s_af_queue   = NULL;
+static QueueHandle_t s_af_queue = NULL;
 
 #define PROP_NAME_MAX 32
 static QueueHandle_t s_prop_queue = NULL;
@@ -395,6 +395,17 @@ static int cam_get_on(esp_http_client_handle_t c, const char *path)
 static int cam_get(const char *path)
 {
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    int r = cam_get_impl(path);
+    xSemaphoreGive(s_http_mutex);
+    return r;
+}
+
+/* Like cam_get but skips the inter-request throttle — for time-critical
+   cancel commands (newstoptake) that must reach the camera immediately. */
+static int cam_get_urgent(const char *path)
+{
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    s_http_last_us = 0;   /* bypass http_throttle */
     int r = cam_get_impl(path);
     xSemaphoreGive(s_http_mutex);
     return r;
@@ -1036,11 +1047,8 @@ static void af_task(void *arg)
                  req.lv_x, req.lv_y);
         ESP_LOGI(TAG, "touch AF → lv (%d,%d)", req.lv_x, req.lv_y);
         cam_get(url);
-        /* OPC has no AF-only command. newstarttake always begins a full capture
-           sequence. Calling newstoptake immediately aborts it after AF but before
-           the shutter fires. 50 ms is enough for the AF result event to arrive. */
-        vTaskDelay(pdMS_TO_TICKS(50));
-        cam_get("/exec_takemotion.cgi?com=newstoptake");
+        vTaskDelay(pdMS_TO_TICKS(80));
+        cam_get_urgent("/exec_takemotion.cgi?com=newstoptake");
     }
 }
 
@@ -2291,8 +2299,27 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
                    Suppress prop_refresh_task for the duration so pushevent callbacks
                    don't compete for the HTTP mutex and slow the sequence down. */
                 s_del_in_progress = true;
-                cam_get("/switch_cameramode.cgi?mode=playmaintenance");
-                ESP_LOGI(TAG, "→playmaintenance body: %.200s", s_resp);
+                bool pm_ok = false;
+                for (int attempt = 0; attempt < 3 && !pm_ok; attempt++) {
+                    /* On retry, cycle standalone→play first — the camera only accepts
+                       playmaintenance after being returned to a clean play state. */
+                    if (attempt) {
+                        cam_get("/switch_cameramode.cgi?mode=standalone");
+                        cam_get("/switch_cameramode.cgi?mode=play");
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                    }
+                    cam_get("/switch_cameramode.cgi?mode=playmaintenance");
+                    ESP_LOGI(TAG, "→playmaintenance body: %.200s", s_resp);
+                    pm_ok = strstr(s_resp, "<result>OK</result>") != NULL;
+                }
+                if (!pm_ok) {
+                    ESP_LOGW(TAG, "playmaintenance NG — skipping erase");
+                    s_del_in_progress = false;
+                    gallery_show_message(fb, "Delete failed");
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    GALLERY_SHOW();
+                    continue;
+                }
                 vTaskDelay(pdMS_TO_TICKS(200));
                 char del_path[128];
                 snprintf(del_path, sizeof(del_path),
@@ -2300,11 +2327,19 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
                          s_gal_dir, s_gal_names[s_gal_idx]);
                 cam_get(del_path);
                 ESP_LOGI(TAG, "exec_erase result: %.200s", s_resp);
+                bool erase_ok = strstr(s_resp, "<result>OK</result>") != NULL;
                 /* Return to playback: playmaintenance→standalone→play */
                 cam_get("/switch_cameramode.cgi?mode=standalone");
                 cam_get("/switch_cameramode.cgi?mode=play");
                 ESP_LOGI(TAG, "→play body: %.200s", s_resp);
                 s_del_in_progress = false;
+                if (!erase_ok) {
+                    ESP_LOGW(TAG, "exec_erase failed");
+                    gallery_show_message(fb, "Delete failed");
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    GALLERY_SHOW();
+                    continue;
+                }
                 for (int i = s_gal_idx; i < s_gal_n - 1; i++)
                     memcpy(s_gal_names[i], s_gal_names[i + 1], GALLERY_NAME_LEN);
                 s_gal_n--;
