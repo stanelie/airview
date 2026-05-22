@@ -44,6 +44,35 @@ static display_mode_t s_display_mode   = DISPLAY_FILL_WIDTH;
 static volatile bool  s_wifi_connected = false;
 static bool           s_ring_on_fb     = false;
 
+/* ── Gallery state ────────────────────────────────────────────────────────── */
+
+#define GALLERY_MAX       100
+#define GALLERY_NAME_LEN  14   /* "PA010001.JPG\0" */
+
+static char s_gal_dir[32]                         = "/DCIM/100OLYMP";
+static char s_gal_names[GALLERY_MAX][GALLERY_NAME_LEN];
+static int  s_gal_n   = 0;
+static int  s_gal_idx = 0;   /* 0 = oldest, s_gal_n-1 = newest */
+
+/* ── Gallery button geometry ──────────────────────────────────────────────── */
+
+#define GAL_DEL_X      176
+#define GAL_DEL_Y       14
+#define GAL_DEL_W       60
+#define GAL_DEL_H       32
+
+#define GAL_CAP_CX     206
+#define GAL_CAP_CY     382
+#define GAL_CAP_R       15
+#define GAL_CAP_HIT_Y  365
+#define GAL_CAP_HIT_H   40
+
+/* Play button in liveview (same x/y as gallery capture button) */
+#define PLAY_BTN_X     181
+#define PLAY_BTN_Y     365
+#define PLAY_BTN_W      50
+#define PLAY_BTN_H      40
+
 /* Display */
 #define LCD_W           412
 #define LCD_H           412
@@ -95,7 +124,8 @@ static int          s_exprev_idx   = 0;
 static char s_battery_str[8] = "---";
 static bool s_charging        = false;
 
-static volatile bool  s_tap_pending = false;
+static volatile bool  s_tap_pending    = false;
+static volatile bool  s_del_in_progress = false;
 static volatile uint16_t s_tap_x   = 0;
 static volatile uint16_t s_tap_y   = 0;
 
@@ -436,8 +466,49 @@ static bool cam_set_prop(const char *name, const char *value)
     return (status == 200 || status == 520);
 }
 
-/* Download binary data (JPEG, XML) directly into a caller-supplied buffer.
-   Returns number of bytes received, or 0 on error. */
+/* Accumulating event handler used by cam_download. */
+typedef struct { uint8_t *buf; int cap; int len; } dl_ctx_t;
+
+static esp_err_t dl_http_evt(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+    dl_ctx_t *c = (dl_ctx_t *)evt->user_data;
+    int n = evt->data_len;
+    if (c->len + n > c->cap - 1) n = c->cap - 1 - c->len;
+    if (n > 0) { memcpy(c->buf + c->len, evt->data, n); c->len += n; }
+    return ESP_OK;
+}
+
+/* GET a resource into a caller-supplied buffer. Returns byte count, 0 on error. */
+static int cam_download(const char *path, uint8_t *buf, int buf_size)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "http://%s%s", CAM_IP, path);
+    dl_ctx_t ctx = { buf, buf_size, 0 };
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = dl_http_evt,
+        .user_data     = &ctx,
+        .timeout_ms    = 5000,
+    };
+    xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+    http_throttle();
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    esp_http_client_set_header(c, "User-Agent", "OlympusCameraKit");
+    esp_http_client_set_header(c, "X-Protocol",  "OlympusCameraKit");
+    esp_err_t err = esp_http_client_perform(c);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(c) : 0;
+    ESP_LOGI(TAG, "download %s → %d (%d B)", path, status, ctx.len);
+    if (ctx.len > 0 && ctx.len < 512 && (buf[0] == '<' || buf[0] == '{'))
+        ESP_LOGI(TAG, "download body: %.200s", (char *)buf);
+    if (status != 200 && status != 520) ctx.len = 0;
+    esp_http_client_cleanup(c);
+    s_http_last_us = esp_timer_get_time();
+    xSemaphoreGive(s_http_mutex);
+    if (ctx.len > 0) buf[ctx.len] = '\0';
+    return ctx.len;
+}
+
 /* ── Field selection tables ───────────────────────────────────────────────── */
 
 #define ARRAY_SIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
@@ -958,8 +1029,10 @@ static void prop_refresh_task(void *arg)
 {
     char prop[PROP_NAME_MAX];
     for (;;) {
-        if (xQueueReceive(s_prop_queue, prop, portMAX_DELAY) == pdTRUE)
-            refresh_prop(prop);
+        if (xQueueReceive(s_prop_queue, prop, portMAX_DELAY) == pdTRUE) {
+            if (!s_del_in_progress)
+                refresh_prop(prop);
+        }
     }
 }
 
@@ -1875,6 +1948,18 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         s_ring_on_fb = true;
     }
 
+    /* Play button — right-pointing triangle in the bottom letterbox */
+    {
+        const int cx = GAL_CAP_CX, cy = GAL_CAP_CY, sz = 13;
+        const uint16_t clr = __builtin_bswap16(0xAD55); /* dim white */
+        for (int x = cx - sz; x <= cx + sz; x++) {
+            int hs = (cx + sz - x) / 2;
+            for (int y = cy - hs; y <= cy + hs; y++)
+                if (x >= 0 && x < LCD_W && y >= 0 && y < LCD_H)
+                    fb[y * LCD_W + x] = clr;
+        }
+    }
+
     const int STRIP_H = 80;
     for (int y = 0; y < LCD_H; y += STRIP_H) {
         int h = (y + STRIP_H <= LCD_H) ? STRIP_H : (LCD_H - y);
@@ -1882,11 +1967,323 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
     }
 }
 
-/* ── Postview ─────────────────────────────────────────────────────────────── */
+/* ── Gallery ──────────────────────────────────────────────────────────────── */
 
-/* Fetch the thumbnail of the last image on the camera and hold it on screen
-   for one second.  Called from the liveview task; jpeg_buf (PSRAM) is reused
-   as a scratch area for both the image-list XML and the thumbnail JPEG. */
+/* Forward declarations — these are defined in the WiFi Setup UI section below. */
+static int  ui_text_w(const char *s, int scale);
+static void ui_fill(uint16_t *fb, int x, int y, int w, int h, uint16_t color);
+static void ui_button(uint16_t *fb, int x, int y, int w, int h,
+                      const char *label, int lscale, uint16_t border, uint16_t fill);
+static bool ui_hit(int tx, int ty, int x, int y, int w, int h);
+static void ui_wait_tap(uint16_t *out_x, uint16_t *out_y);
+
+static void gallery_flush(uint16_t *fb)
+{
+    const int SH = 40;
+    for (int y = 0; y < LCD_H; y += SH) {
+        int h = (y + SH <= LCD_H) ? SH : (LCD_H - y);
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_W, y + h, fb + y * LCD_W);
+    }
+}
+
+static void gallery_show_message(uint16_t *fb, const char *msg)
+{
+    memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+    int tw = ui_text_w(msg, 2);
+    splash_draw_text(fb, (LCD_W - tw) / 2, LCD_H / 2 - 8, 2, msg, 0xFFFF);
+    gallery_flush(fb);
+}
+
+static int gallery_fetch_list(uint8_t *buf, int buf_size)
+{
+    /* Camera returns CSV, not XML.  Format:
+         VER_100\r\n
+         /DCIM,100OLYMP,0,16,23731,30948\r\n          ← directory listing
+       and for files:
+         VER_100\r\n
+         /DCIM/100OLYMP,PA010001.JPG,size,attr,d,t\r\n
+         ...                                            */
+
+    s_gal_n = 0;
+    s_gal_dir[0] = '\0';
+
+    /* ── Step 1: discover subdirectory under /DCIM ── */
+    int n = cam_download("/get_imglist.cgi?DIR=/DCIM", buf, buf_size - 1);
+    ESP_LOGI(TAG, "imglist /DCIM: %d B [%.120s]", n, n > 0 ? (char *)buf : "");
+    if (n > 0) {
+        buf[n] = '\0';
+        char *p = (char *)buf;
+        /* Skip "VER_100" header line */
+        while (*p && *p != '\n') p++;
+        if (*p) p++;
+        /* Line: /DCIM,100OLYMP,...  →  field0=/DCIM, field1=100OLYMP */
+        char *c1 = strchr(p, ',');
+        char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
+        if (c1 && c1 < eol) {
+            int plen = (int)(c1 - p);
+            char *f1 = c1 + 1;
+            char *c2 = strchr(f1, ',');
+            char *f1e = (c2 && c2 < eol) ? c2 : eol;
+            while (f1e > f1 && (f1e[-1] == '\r' || f1e[-1] == '\n')) f1e--;
+            int dlen = (int)(f1e - f1);
+            if (plen + 1 + dlen < (int)sizeof(s_gal_dir)) {
+                memcpy(s_gal_dir, p, plen);
+                s_gal_dir[plen] = '/';
+                memcpy(s_gal_dir + plen + 1, f1, dlen);
+                s_gal_dir[plen + 1 + dlen] = '\0';
+            }
+        }
+    }
+    if (!s_gal_dir[0])
+        strncpy(s_gal_dir, "/DCIM/100OLYMP", sizeof(s_gal_dir) - 1);
+    ESP_LOGI(TAG, "gallery dir: %s", s_gal_dir);
+
+    /* ── Step 2: fetch file list ── */
+    char path[64];
+    snprintf(path, sizeof(path), "/get_imglist.cgi?DIR=%s", s_gal_dir);
+    n = cam_download(path, buf, buf_size - 1);
+    ESP_LOGI(TAG, "imglist %s: %d B", s_gal_dir, n);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+
+    char *p = (char *)buf;
+    /* Skip VER header */
+    while (*p && *p != '\n') p++;
+    if (*p) p++;
+
+    while (*p && s_gal_n < GALLERY_MAX) {
+        char *eol = strchr(p, '\n'); if (!eol) eol = p + strlen(p);
+        /* field0=parent_dir, field1=filename */
+        char *c1 = strchr(p, ',');
+        if (c1 && c1 < eol) {
+            char *name = c1 + 1;
+            char *c2   = strchr(name, ',');
+            char *nend = (c2 && c2 < eol) ? c2 : eol;
+            while (nend > name && (nend[-1] == '\r' || nend[-1] == '\n')) nend--;
+            int len = (int)(nend - name);
+            /* Only store JPEG files — skip RAW, MOV, etc. */
+            if (len >= 4 && len < GALLERY_NAME_LEN &&
+                    name[len-4] == '.' && name[len-3] == 'J' &&
+                    name[len-2] == 'P' && name[len-1] == 'G') {
+                memcpy(s_gal_names[s_gal_n], name, len);
+                s_gal_names[s_gal_n][len] = '\0';
+                s_gal_n++;
+            }
+        }
+        p = (*eol) ? eol + 1 : eol;
+    }
+
+    /* The imglist comes back in FAT directory order, which is not reliable
+       after deletions.  Olympus filenames are PMMDDXXXX.JPG where XXXX is a
+       global shot counter.  Sort ascending by that counter so s_gal_n-1 is
+       always the most recently taken photo. */
+    for (int i = 1; i < s_gal_n; i++) {
+        char tmp[GALLERY_NAME_LEN];
+        memcpy(tmp, s_gal_names[i], GALLERY_NAME_LEN);
+        int tlen = (int)strlen(tmp);
+        int seq_t = (tlen >= 8) ? atoi(tmp + tlen - 8) : 0;
+        int j = i - 1;
+        while (j >= 0) {
+            int jlen = (int)strlen(s_gal_names[j]);
+            if ((jlen >= 8 ? atoi(s_gal_names[j] + jlen - 8) : 0) <= seq_t) break;
+            memcpy(s_gal_names[j + 1], s_gal_names[j], GALLERY_NAME_LEN);
+            j--;
+        }
+        memcpy(s_gal_names[j + 1], tmp, GALLERY_NAME_LEN);
+    }
+
+    ESP_LOGI(TAG, "gallery: %d files", s_gal_n);
+    for (int _i = (s_gal_n > 4 ? s_gal_n - 4 : 0); _i < s_gal_n; _i++)
+        ESP_LOGI(TAG, "  [%d] %s", _i, s_gal_names[_i]);
+    return s_gal_n;
+}
+
+static void draw_record_icon(uint16_t *fb, int cx, int cy, int r, uint16_t color)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int d2 = dx * dx + dy * dy;
+            int y = cy + dy, x = cx + dx;
+            if (y < 0 || y >= LCD_H || x < 0 || x >= LCD_W) continue;
+            int ri = r - 3, rf = r * 5 / 8;
+            if (d2 <= r * r && d2 >= ri * ri) fb[y * LCD_W + x] = color;
+            if (d2 <= rf * rf)                 fb[y * LCD_W + x] = color;
+        }
+    }
+}
+
+static void gallery_draw(uint16_t *fb, const uint8_t *jpeg_data, int jpeg_len)
+{
+    static uint8_t gal_work[16384];
+    memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+
+    if (jpeg_len > 0) {
+        jpeg_ctx_t ctx = {
+            .data = jpeg_data, .len = (size_t)jpeg_len, .pos = 0, .fb = fb,
+        };
+        JDEC jd;
+        if (jd_prepare(&jd, jpeg_infunc, gal_work, sizeof(gal_work), &ctx) == JDR_OK) {
+            ESP_LOGI(TAG, "gallery JPEG %dx%d (%d B)", jd.width, jd.height, jpeg_len);
+            ctx.src_w = jd.width;
+            ctx.src_h = jd.height;
+            ctx.dst_w = LCD_W;
+            ctx.dst_h = (int)jd.height * LCD_W / (int)jd.width;
+            ctx.x_off = 0;
+            ctx.y_off = (LCD_H - ctx.dst_h) / 2;
+            for (int i = 0; i <= ctx.src_w; i++) {
+                int x = ctx.x_off + (i * ctx.dst_w + ctx.src_w - 1) / ctx.src_w;
+                s_xmap[i] = (x < 0) ? 0 : (x > LCD_W) ? LCD_W : x;
+            }
+            for (int j = 0; j <= ctx.src_h; j++) {
+                int y = ctx.y_off + (j * ctx.dst_h + ctx.src_h - 1) / ctx.src_h;
+                s_ymap[j] = (y < 0) ? 0 : (y > LCD_H) ? LCD_H : y;
+            }
+            jd_decomp(&jd, jpeg_outfunc, 0);
+        }
+    }
+
+    fill_outside_circle(fb, 0x0000);
+
+    const uint16_t red   = __builtin_bswap16(0xF800);
+    const uint16_t green = __builtin_bswap16(0x07E0);
+
+    ui_button(fb, GAL_DEL_X, GAL_DEL_Y, GAL_DEL_W, GAL_DEL_H, NULL, 0, 0x0000, red);
+    {
+        int tw = ui_text_w("DEL", 2);
+        int tx = GAL_DEL_X + (GAL_DEL_W - tw) / 2 + 3;
+        int ty = GAL_DEL_Y + (GAL_DEL_H - 8 * 2) / 2;
+        splash_draw_text(fb, tx, ty, 2, "DEL", 0xFFFF);
+    }
+
+    char counter[24];
+    int pos_n = s_gal_idx + 1;  /* N = newest */
+    snprintf(counter, sizeof(counter), "%d/%d", pos_n, s_gal_n);
+    int ctw = ui_text_w(counter, 2);
+    /* Right-align counter at top right, OSD style (black box, white text) */
+    draw_osd_text(fb, 329 - ctw, 55, 2, counter, false, false, 0);
+
+    draw_record_icon(fb, GAL_CAP_CX, GAL_CAP_CY, GAL_CAP_R, green);
+
+    gallery_flush(fb);
+}
+
+static bool gallery_confirm_delete(uint16_t *fb)
+{
+    const int bx = 80, by = 158, bw = 252, bh = 100;
+    const uint16_t dark  = __builtin_bswap16(0x2104);
+    const uint16_t red   = __builtin_bswap16(0xF800);
+    const uint16_t green = __builtin_bswap16(0x07E0);
+
+    ui_fill(fb, bx, by, bw, bh, dark);
+    for (int t = 0; t < 2; t++) {
+        for (int col = bx - t; col <= bx + bw + t; col++) {
+            if (col < 0 || col >= LCD_W) continue;
+            if (by - t >= 0 && by - t < LCD_H) fb[(by - t) * LCD_W + col] = 0xFFFF;
+            if (by + bh + t < LCD_H)             fb[(by + bh + t) * LCD_W + col] = 0xFFFF;
+        }
+        for (int row = by - t; row <= by + bh + t; row++) {
+            if (row < 0 || row >= LCD_H) continue;
+            if (bx - t >= 0 && bx - t < LCD_W)     fb[row * LCD_W + (bx - t)] = 0xFFFF;
+            if (bx + bw + t < LCD_W)                fb[row * LCD_W + (bx + bw + t)] = 0xFFFF;
+        }
+    }
+    int tw = ui_text_w("Delete?", 2);
+    splash_draw_text(fb, bx + (bw - tw) / 2, by + 16, 2, "Delete?", 0xFFFF);
+    ui_button(fb, bx + 20,  by + 56, 90, 34, "NO",  2, red,   0x0000);
+    ui_button(fb, bx + 142, by + 56, 90, 34, "YES", 2, green, 0x0000);
+    gallery_flush(fb);
+
+    uint16_t tx, ty;
+    ui_wait_tap(&tx, &ty);
+    return ui_hit(tx, ty, bx + 142, by + 56, 90, 34);  /* YES */
+}
+
+static int gallery_fetch_thumb(int idx, uint8_t *buf)
+{
+    char path[160];
+    snprintf(path, sizeof(path), "/get_thumbnail.cgi?DIR=%s/%s",
+             s_gal_dir, s_gal_names[idx]);
+    int n = cam_download(path, buf, JPEG_BUF_SIZE);
+    return (n > 2 && buf[0] == 0xFF && buf[1] == 0xD8) ? n : 0;
+}
+
+static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
+{
+    cam_get("/switch_cameramode.cgi?mode=play");
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    gallery_show_message(fb, "Loading...");
+    if (gallery_fetch_list(jpeg_buf, JPEG_BUF_SIZE) == 0) {
+        gallery_show_message(fb, "No images");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+
+    s_gal_idx = s_gal_n - 1;  /* start at newest */
+
+#define GALLERY_SHOW() do { \
+    int _tlen = gallery_fetch_thumb(s_gal_idx, jpeg_buf); \
+    gallery_draw(fb, jpeg_buf, _tlen); \
+} while (0)
+
+    GALLERY_SHOW();
+    s_tap_pending = false;
+
+    while (true) {
+        if (!s_tap_pending) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        s_tap_pending = false;
+        uint16_t tx = s_tap_x, ty = s_tap_y;
+
+        /* Capture button — bottom centre → back to liveview */
+        if (ui_hit(tx, ty, GAL_CAP_CX - GAL_CAP_R - 5, GAL_CAP_HIT_Y,
+                   (GAL_CAP_R + 5) * 2, GAL_CAP_HIT_H))
+            break;
+
+        /* Delete button — top left */
+        if (ui_hit(tx, ty, GAL_DEL_X, GAL_DEL_Y, GAL_DEL_W, GAL_DEL_H)) {
+            if (gallery_confirm_delete(fb)) {
+                gallery_show_message(fb, "Deleting...");
+                /* Gallery is already in play mode — go directly to playmaintenance.
+                   (standalone→playmaintenance returns NG on Air A01; play→playmaintenance works.)
+                   Suppress prop_refresh_task for the duration so pushevent callbacks
+                   don't compete for the HTTP mutex and slow the sequence down. */
+                s_del_in_progress = true;
+                cam_get("/switch_cameramode.cgi?mode=playmaintenance");
+                ESP_LOGI(TAG, "→playmaintenance body: %.200s", s_resp);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                char del_path[128];
+                snprintf(del_path, sizeof(del_path),
+                         "/exec_erase.cgi?DIR=%s/%s",
+                         s_gal_dir, s_gal_names[s_gal_idx]);
+                cam_get(del_path);
+                ESP_LOGI(TAG, "exec_erase result: %.200s", s_resp);
+                /* Return to playback: playmaintenance→standalone→play */
+                cam_get("/switch_cameramode.cgi?mode=standalone");
+                cam_get("/switch_cameramode.cgi?mode=play");
+                ESP_LOGI(TAG, "→play body: %.200s", s_resp);
+                s_del_in_progress = false;
+                for (int i = s_gal_idx; i < s_gal_n - 1; i++)
+                    memcpy(s_gal_names[i], s_gal_names[i + 1], GALLERY_NAME_LEN);
+                s_gal_n--;
+                if (s_gal_n == 0) {
+                    gallery_show_message(fb, "No images");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    break;
+                }
+                if (s_gal_idx >= s_gal_n) s_gal_idx = s_gal_n - 1;
+            }
+            GALLERY_SHOW();
+            continue;
+        }
+
+        /* Navigation: left half = newer, right half = older */
+        bool go_newer = (tx < LCD_W / 2);
+        if (go_newer && s_gal_idx < s_gal_n - 1) { s_gal_idx++; GALLERY_SHOW(); }
+        else if (!go_newer && s_gal_idx > 0)      { s_gal_idx--; GALLERY_SHOW(); }
+    }
+#undef GALLERY_SHOW
+}
+
 /* ── Liveview loop ────────────────────────────────────────────────────────── */
 
 static void liveview_loop(uint8_t *jpeg_buf, uint16_t *fb)
@@ -1913,9 +2310,14 @@ restart:;
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Issue the three startup commands on one persistent TCP connection.
-       A fresh TCP handshake per call plus the 150 ms inter-call throttle would
-       add ~300 ms; keep-alive collapses that to a single handshake + no gaps. */
+    /* Switch to rec mode and wait for the camera to settle.  Sending
+       changelvqty immediately after the mode switch (20 ms round-trip on
+       keep-alive) returns 520 because the camera hasn't finished the
+       internal transition yet. */
+    cam_get("/switch_cameramode.cgi?mode=rec");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* Fire changelvqty + startliveview on one keep-alive connection. */
     {
         char lv_url[64];
         snprintf(lv_url, sizeof(lv_url),
@@ -1932,7 +2334,6 @@ restart:;
         esp_http_client_handle_t kc = esp_http_client_init(&kcfg);
         esp_http_client_set_header(kc, "User-Agent", "OlympusCameraKit");
         esp_http_client_set_header(kc, "X-Protocol",  "OlympusCameraKit");
-        cam_get_on(kc, "/switch_cameramode.cgi?mode=rec");
         cam_get_on(kc, "/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
         cam_get_on(kc, lv_url);
         esp_http_client_cleanup(kc);
@@ -2028,6 +2429,7 @@ restart:;
         }
 
         if (m) {
+            bool want_gallery = false;
             if (s_tap_pending) {
                 s_tap_pending = false;
                 uint16_t tx = s_tap_x, ty = s_tap_y;
@@ -2058,6 +2460,11 @@ restart:;
                                  s_wb_cam[s_wb_idx].api);
                         cam_set_prop_async("WB", s_wb_cam[s_wb_idx].api);
                     }
+                } else if (ty >= PLAY_BTN_Y &&
+                           ui_hit(tx, ty, PLAY_BTN_X, PLAY_BTN_Y,
+                                  PLAY_BTN_W, PLAY_BTN_H)) {
+                    /* Play button — enter gallery */
+                    want_gallery = true;
                 } else if (ty >= 324) {
                     /* OSD strip (text y=340–356, +one row above): shutter/exprev/aperture */
                     int field;
@@ -2083,6 +2490,20 @@ restart:;
                         xQueueOverwrite(s_af_queue, &req);
                     }
                 }
+            }
+            if (want_gallery) {
+                gallery_show_message(fb, "Loading...");
+                cam_get("/exec_takemisc.cgi?com=stopliveview");
+                close(sock);
+                gallery_loop(jpeg_buf, fb);
+                memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+                gallery_flush(fb);
+                /* After gallery (especially if a delete ran through playmaintenance),
+                   the camera can't start liveview from play mode — changelvqty returns
+                   520 even with a 500ms delay after switch rec.  Going via standalone
+                   first gives the camera a clean base; standalone → rec works. */
+                cam_get("/switch_cameramode.cgi?mode=standalone");
+                goto restart;
             }
             decode_and_display(jpeg_buf, jpeg_off, fb);
             frames++;
