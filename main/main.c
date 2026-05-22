@@ -701,17 +701,26 @@ static void build_prop_lists(void)
 }
 
 
+static bool exprev_list_has_negatives(void)
+{
+    for (int i = 0; i < s_exprev_cam_n; i++)
+        if (s_exprev_cam[i].str[0] == '-') return true;
+    return false;
+}
+
 static void build_exprev_list(void)
 {
     s_exprev_cam_n = 0;
+
+    /* Try getlist first — same <item> format used by APERTURE/ISO. */
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
-    int st = cam_get_impl("/get_camprop.cgi?com=desc&propname=EXPREV");
+    int st = cam_get_impl("/get_camprop.cgi?com=getlist&propname=EXPREV");
     if (st == 200 || st == 520) {
-        ESP_LOGI(TAG, "EXPREV desc [%d]: %s", st, s_resp);
-        char tokens[EXPREV_CAM_MAX][20];
-        int n = parse_enum_list(s_resp, tokens, EXPREV_CAM_MAX);
+        ESP_LOGI(TAG, "EXPREV getlist [%d]: %s", st, s_resp);
+        char items[EXPREV_CAM_MAX][12];
+        int n = parse_item_list(s_resp, items, EXPREV_CAM_MAX, 8);
         for (int i = 0; i < n && s_exprev_cam_n < EXPREV_CAM_MAX; i++) {
-            strncpy(s_exprev_cam[s_exprev_cam_n].str, tokens[i],
+            strncpy(s_exprev_cam[s_exprev_cam_n].str, items[i],
                     sizeof(s_exprev_cam[0].str) - 1);
             s_exprev_cam[s_exprev_cam_n].str[sizeof(s_exprev_cam[0].str) - 1] = '\0';
             s_exprev_cam_n++;
@@ -719,7 +728,28 @@ static void build_exprev_list(void)
     }
     xSemaphoreGive(s_http_mutex);
 
-    if (s_exprev_cam_n == 0) {
+    /* If getlist returned no negative values, try desc instead. */
+    if (!exprev_list_has_negatives()) {
+        s_exprev_cam_n = 0;
+        xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+        st = cam_get_impl("/get_camprop.cgi?com=desc&propname=EXPREV");
+        if (st == 200 || st == 520) {
+            ESP_LOGI(TAG, "EXPREV desc [%d]: %s", st, s_resp);
+            char tokens[EXPREV_CAM_MAX][20];
+            int n = parse_enum_list(s_resp, tokens, EXPREV_CAM_MAX);
+            for (int i = 0; i < n && s_exprev_cam_n < EXPREV_CAM_MAX; i++) {
+                strncpy(s_exprev_cam[s_exprev_cam_n].str, tokens[i],
+                        sizeof(s_exprev_cam[0].str) - 1);
+                s_exprev_cam[s_exprev_cam_n].str[sizeof(s_exprev_cam[0].str) - 1] = '\0';
+                s_exprev_cam_n++;
+            }
+        }
+        xSemaphoreGive(s_http_mutex);
+    }
+
+    /* Hardcoded fallback if both APIs returned only non-negative values. */
+    if (!exprev_list_has_negatives()) {
+        s_exprev_cam_n = 0;
         static const char *fb[] = {
             "-3.0","-2.7","-2.3","-2.0","-1.7","-1.3","-1.0","-0.7","-0.3",
             "0.0",
@@ -732,8 +762,12 @@ static void build_exprev_list(void)
             s_exprev_cam_n++;
         }
     }
+
     if (s_exprev_idx >= s_exprev_cam_n) s_exprev_idx = 0;
-    ESP_LOGI(TAG, "EXPREV: %d entries", s_exprev_cam_n);
+    ESP_LOGI(TAG, "EXPREV: %d entries, first=%s last=%s",
+             s_exprev_cam_n,
+             s_exprev_cam_n > 0 ? s_exprev_cam[0].str : "-",
+             s_exprev_cam_n > 0 ? s_exprev_cam[s_exprev_cam_n - 1].str : "-");
 }
 
 /* Fire-and-forget cam_set_prop: spawns a task so liveview_loop is never blocked
@@ -877,8 +911,8 @@ static void adjust_field(int field, int delta)
         int idx = s_exprev_idx + delta;
         if (idx < 0) idx = 0;
         if (idx >= n) idx = n - 1;
-        ESP_LOGI(TAG, "exprev: %s → %s",
-                 s_exprev_cam[s_exprev_idx].str, s_exprev_cam[idx].str);
+        ESP_LOGI(TAG, "exprev[%d/%d]: %s → %s",
+                 s_exprev_idx, n, s_exprev_cam[s_exprev_idx].str, s_exprev_cam[idx].str);
         s_exprev_idx = idx;
         cam_set_prop_async("EXPREV", s_exprev_cam[idx].str);
     }
@@ -1017,6 +1051,15 @@ static void init_props_task(void *arg)
     char batt_val[12] = {0};
     if (cam_get_prop("BATTERY_LEVEL", batt_val, sizeof(batt_val)))
         set_battery_str(batt_val);
+
+    /* Read actual shoot mode so field_selectable() works correctly from boot. */
+    char mode_val[12] = {0};
+    if (cam_get_prop("TAKEMODE", mode_val, sizeof(mode_val))) {
+        for (int i = 0; i < NUM_MODES; i++) {
+            if (strcmp(mode_val, s_mode_api[i]) == 0) { s_shoot_mode = i; break; }
+        }
+        ESP_LOGI(TAG, "TAKEMODE: %s → mode %d", mode_val, s_shoot_mode);
+    }
 
     build_prop_lists();
 
