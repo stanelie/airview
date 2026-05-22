@@ -2299,15 +2299,13 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
                    Suppress prop_refresh_task for the duration so pushevent callbacks
                    don't compete for the HTTP mutex and slow the sequence down. */
                 s_del_in_progress = true;
+                /* The camera only accepts playmaintenance after a standalone→play
+                   cycle; skip straight to that rather than burning a doomed attempt. */
                 bool pm_ok = false;
                 for (int attempt = 0; attempt < 3 && !pm_ok; attempt++) {
-                    /* On retry, cycle standalone→play first — the camera only accepts
-                       playmaintenance after being returned to a clean play state. */
-                    if (attempt) {
-                        cam_get("/switch_cameramode.cgi?mode=standalone");
-                        cam_get("/switch_cameramode.cgi?mode=play");
-                        vTaskDelay(pdMS_TO_TICKS(500));
-                    }
+                    if (attempt) vTaskDelay(pdMS_TO_TICKS(500));
+                    cam_get("/switch_cameramode.cgi?mode=standalone");
+                    cam_get("/switch_cameramode.cgi?mode=play");
                     cam_get("/switch_cameramode.cgi?mode=playmaintenance");
                     ESP_LOGI(TAG, "→playmaintenance body: %.200s", s_resp);
                     pm_ok = strstr(s_resp, "<result>OK</result>") != NULL;
