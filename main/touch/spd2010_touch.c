@@ -101,3 +101,10 @@ bool touch_poll_tap(uint16_t *out_x, uint16_t *out_y)
 
     return tapped;
 }
+
+bool touch_is_down(uint16_t *out_x, uint16_t *out_y)
+{
+    if (out_x) *out_x = s_last_x;
+    if (out_y) *out_y = s_last_y;
+    return s_was_down;
+}

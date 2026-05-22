@@ -131,21 +131,49 @@ static int          s_exprev_idx   = 0;
 static char s_battery_str[8] = "---";
 static bool s_charging        = false;
 
-static volatile bool  s_tap_pending    = false;
-static volatile bool  s_del_in_progress = false;
-static volatile uint16_t s_tap_x   = 0;
-static volatile uint16_t s_tap_y   = 0;
+static volatile bool  s_tap_pending       = false;
+static volatile bool  s_del_in_progress   = false;
+static volatile uint16_t s_tap_x          = 0;
+static volatile uint16_t s_tap_y          = 0;
+
+#define LONG_PRESS_MS 600
+static volatile bool     s_long_press_pending = false;
+static volatile uint16_t s_long_press_x       = 0;
+static volatile uint16_t s_long_press_y       = 0;
 
 
 static void touch_task(void *arg)
 {
     uint16_t x, y;
+    bool     prev_down   = false;
+    int64_t  press_start = 0;
+    bool     long_fired  = false;
+
     while (true) {
-        if (touch_poll_tap(&x, &y)) {
+        bool     tapped = touch_poll_tap(&x, &y);
+        uint16_t cx, cy;
+        bool     down   = touch_is_down(&cx, &cy);
+
+        if (down && !prev_down) {
+            press_start = esp_timer_get_time();
+            long_fired  = false;
+        }
+        if (down && !long_fired) {
+            int64_t held_ms = (esp_timer_get_time() - press_start) / 1000LL;
+            if (held_ms >= LONG_PRESS_MS) {
+                s_long_press_x       = cx;
+                s_long_press_y       = cy;
+                s_long_press_pending = true;
+                long_fired           = true;
+            }
+        }
+        if (tapped && !long_fired) {
             s_tap_x       = x;
             s_tap_y       = y;
             s_tap_pending = true;
         }
+
+        prev_down = down;
         vTaskDelay(pdMS_TO_TICKS(10)); /* 100 Hz */
     }
 }
@@ -2043,6 +2071,8 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
 /* Forward declarations — these are defined in the WiFi Setup UI section below. */
 static int  ui_text_w(const char *s, int scale);
 static void ui_fill(uint16_t *fb, int x, int y, int w, int h, uint16_t color);
+static void ui_flush(uint16_t *fb);
+static void ui_text_center(uint16_t *fb, int box_x, int box_w, int ty, int scale, const char *s, uint16_t color);
 static void ui_button(uint16_t *fb, int x, int y, int w, int h,
                       const char *label, int lscale, uint16_t border, uint16_t fill);
 static bool ui_hit(int tx, int ty, int x, int y, int w, int h);
@@ -2380,6 +2410,54 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
 #undef GALLERY_SHOW
 }
 
+/* ── Settings menu ────────────────────────────────────────────────────────── */
+
+#define SETTINGS_TOGGLE_X   106
+#define SETTINGS_TOGGLE_Y   190
+#define SETTINGS_TOGGLE_W   200
+#define SETTINGS_TOGGLE_H    44
+#define SETTINGS_DONE_X     156
+#define SETTINGS_DONE_Y     268
+#define SETTINGS_DONE_W     100
+#define SETTINGS_DONE_H      38
+
+static void settings_draw(uint16_t *fb)
+{
+    const uint16_t white = __builtin_bswap16(0xFFFF);
+    const uint16_t green = __builtin_bswap16(0x07E0);
+    const uint16_t grey  = __builtin_bswap16(0x2104);
+
+    memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+    ui_text_center(fb, 0, LCD_W, 148, 3, "SETTINGS", white);
+
+    const char *lbl = (s_tap_action == TAP_ACTION_FOCUS) ? "TAP: FOCUS" : "TAP: SHOOT";
+    ui_button(fb, SETTINGS_TOGGLE_X, SETTINGS_TOGGLE_Y,
+              SETTINGS_TOGGLE_W, SETTINGS_TOGGLE_H, lbl, 2, white, grey);
+
+    ui_button(fb, SETTINGS_DONE_X, SETTINGS_DONE_Y,
+              SETTINGS_DONE_W, SETTINGS_DONE_H, "DONE", 2, green, 0x0000);
+
+    ui_flush(fb);
+}
+
+static void settings_menu(uint16_t *fb)
+{
+    settings_draw(fb);
+    for (;;) {
+        uint16_t tx, ty;
+        ui_wait_tap(&tx, &ty);
+        if (ui_hit(tx, ty, SETTINGS_TOGGLE_X, SETTINGS_TOGGLE_Y,
+                   SETTINGS_TOGGLE_W, SETTINGS_TOGGLE_H)) {
+            s_tap_action = (s_tap_action == TAP_ACTION_FOCUS)
+                           ? TAP_ACTION_SHOOT : TAP_ACTION_FOCUS;
+            settings_draw(fb);
+        } else if (ui_hit(tx, ty, SETTINGS_DONE_X, SETTINGS_DONE_Y,
+                          SETTINGS_DONE_W, SETTINGS_DONE_H)) {
+            break;
+        }
+    }
+}
+
 /* ── Liveview loop ────────────────────────────────────────────────────────── */
 
 static void liveview_loop(uint8_t *jpeg_buf, uint16_t *fb)
@@ -2526,6 +2604,18 @@ restart:;
 
         if (m) {
             bool want_gallery = false;
+
+            if (s_long_press_pending) {
+                s_long_press_pending = false;
+                uint16_t lpx = s_long_press_x, lpy = s_long_press_y;
+                if (lpy >= PLAY_BTN_Y &&
+                    ui_hit(lpx, lpy, PLAY_BTN_X, PLAY_BTN_Y, PLAY_BTN_W, PLAY_BTN_H)) {
+                    settings_menu(fb);
+                    memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
+                    s_ring_on_fb = false;
+                }
+            }
+
             if (s_tap_pending) {
                 s_tap_pending = false;
                 uint16_t tx = s_tap_x, ty = s_tap_y;
