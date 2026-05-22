@@ -101,6 +101,13 @@ static const char *s_mode_api[]     = {"P", "A", "S", "M", "iAuto"};
 
 static int            s_shoot_mode  = 0;
 
+typedef enum {
+    TAP_ACTION_FOCUS,   /* AF only — no capture */
+    TAP_ACTION_SHOOT,   /* AF then capture (newstarttake / newstoptake) */
+} tap_action_t;
+
+static tap_action_t s_tap_action = TAP_ACTION_FOCUS;
+
 typedef struct { const char *api; const char *label; } wb_cam_t;
 static const wb_cam_t s_wb_cam[] = {
     {"WB_AUTO",           "AWB"},
@@ -330,7 +337,7 @@ static esp_err_t http_evt(esp_http_client_event_t *evt)
 
 /* Minimum gap between any two HTTP calls. The camera's embedded server
    cannot handle rapid-fire connections and stops responding after a burst. */
-#define HTTP_MIN_GAP_MS 150
+#define HTTP_MIN_GAP_MS 50
 
 static int64_t s_http_last_us = 0;
 
@@ -1042,13 +1049,26 @@ static void af_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_af_queue, &req, portMAX_DELAY) != pdTRUE) continue;
         char url[80];
-        snprintf(url, sizeof(url),
-                 "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
+        ESP_LOGI(TAG, "touch %s → lv (%d,%d)",
+                 s_tap_action == TAP_ACTION_SHOOT ? "shoot" : "AF",
                  req.lv_x, req.lv_y);
-        ESP_LOGI(TAG, "touch AF → lv (%d,%d)", req.lv_x, req.lv_y);
-        cam_get(url);
-        vTaskDelay(pdMS_TO_TICKS(80));
-        cam_get_urgent("/exec_takemotion.cgi?com=newstoptake");
+
+        if (s_tap_action == TAP_ACTION_SHOOT) {
+            snprintf(url, sizeof(url),
+                     "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
+                     req.lv_x, req.lv_y);
+            cam_get(url);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            cam_get_urgent("/exec_takemotion.cgi?com=newstoptake");
+        } else {
+            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseaflock");
+            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseafframe");
+            snprintf(url, sizeof(url),
+                     "/exec_takemotion.cgi?com=newassignafframe&point=%04dx%04d",
+                     req.lv_x, req.lv_y);
+            cam_get_urgent(url);
+            cam_get_urgent("/exec_takemotion.cgi?com=newexecaflock");
+        }
     }
 }
 
