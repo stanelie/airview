@@ -108,6 +108,8 @@ typedef enum {
 
 static tap_action_t s_tap_action = TAP_ACTION_FOCUS;
 
+static int s_brightness = 8;    /* 1–10; applied via LEDC backlight */
+
 typedef struct { const char *api; const char *label; } wb_cam_t;
 static const wb_cam_t s_wb_cam[] = {
     {"WB_AUTO",           "AWB"},
@@ -1317,6 +1319,18 @@ static void display_init(void)
     ESP_LOGI(TAG, "display ready");
 }
 
+static void set_backlight(int level)
+{
+    /* CIE 1931 lightness curve for perceptually equal steps.
+       Derived from Y = ((L* + 16) / 116)^3, L* = level * 10, mapped to
+       13-bit PWM range 50–8190 (floor keeps backlight alive at level 1). */
+    static const uint32_t duty_lut[10] = {
+        142, 293, 558, 966, 1549, 2340, 3368, 4665, 6261, 8190
+    };
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty_lut[level - 1]);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
 /* ── Splash / clear screen ────────────────────────────────────────────────── */
 
 /* 8×8 bitmap font: bit N set → pixel N on (bit 0 = leftmost).
@@ -2415,11 +2429,20 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
 /* ── Settings menu ────────────────────────────────────────────────────────── */
 
 #define SETTINGS_TOGGLE_X   106
-#define SETTINGS_TOGGLE_Y   190
+#define SETTINGS_TOGGLE_Y   129
 #define SETTINGS_TOGGLE_W   200
 #define SETTINGS_TOGGLE_H    44
+#define SETTINGS_BRIGHT_LBL_Y  187
+#define SETTINGS_DIM_X      106
+#define SETTINGS_DIM_Y      199
+#define SETTINGS_DIM_W       50
+#define SETTINGS_DIM_H       38
+#define SETTINGS_PLUS_X     256
+#define SETTINGS_PLUS_Y     199
+#define SETTINGS_PLUS_W      50
+#define SETTINGS_PLUS_H      38
 #define SETTINGS_DONE_X     156
-#define SETTINGS_DONE_Y     268
+#define SETTINGS_DONE_Y     312
 #define SETTINGS_DONE_W     100
 #define SETTINGS_DONE_H      38
 
@@ -2430,11 +2453,20 @@ static void settings_draw(uint16_t *fb)
     const uint16_t grey  = __builtin_bswap16(0x2104);
 
     memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
-    ui_text_center(fb, 0, LCD_W, 148, 3, "SETTINGS", white);
+    ui_text_center(fb, 0, LCD_W, 30, 3, "SETTINGS", white);
 
     const char *lbl = (s_tap_action == TAP_ACTION_FOCUS) ? "TAP: FOCUS" : "TAP: SHOOT";
     ui_button(fb, SETTINGS_TOGGLE_X, SETTINGS_TOGGLE_Y,
               SETTINGS_TOGGLE_W, SETTINGS_TOGGLE_H, lbl, 2, white, grey);
+
+    ui_text_center(fb, 0, LCD_W, SETTINGS_BRIGHT_LBL_Y, 1, "BRIGHTNESS", white);
+    ui_button(fb, SETTINGS_DIM_X,  SETTINGS_DIM_Y,  SETTINGS_DIM_W,  SETTINGS_DIM_H,  "-", 2, white, grey);
+    ui_button(fb, SETTINGS_PLUS_X, SETTINGS_PLUS_Y, SETTINGS_PLUS_W, SETTINGS_PLUS_H, "+", 2, white, grey);
+    char val[4];
+    snprintf(val, sizeof(val), "%d", s_brightness);
+    ui_text_center(fb, SETTINGS_DIM_X + SETTINGS_DIM_W,
+                   SETTINGS_PLUS_X - (SETTINGS_DIM_X + SETTINGS_DIM_W),
+                   SETTINGS_DIM_Y + (SETTINGS_DIM_H - 16) / 2, 2, val, white);
 
     ui_button(fb, SETTINGS_DONE_X, SETTINGS_DONE_Y,
               SETTINGS_DONE_W, SETTINGS_DONE_H, "DONE", 2, green, 0x0000);
@@ -2442,19 +2474,50 @@ static void settings_draw(uint16_t *fb)
     ui_flush(fb);
 }
 
-static void settings_menu(uint16_t *fb)
+static void settings_menu(uint16_t *fb, int lv_sock)
 {
+    /* Drain the liveview UDP socket while waiting for taps so the camera's
+       WiFi TX queue never backs up and starves HTTP connections. */
+    uint8_t drain_buf[1500];
+
     settings_draw(fb);
     for (;;) {
         uint16_t tx, ty;
-        ui_wait_tap(&tx, &ty);
+        s_tap_pending = false;
+        while (!s_tap_pending) {
+            while (recv(lv_sock, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0) {}
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        s_tap_pending = false;
+        tx = s_tap_x;
+        ty = s_tap_y;
         if (ui_hit(tx, ty, SETTINGS_TOGGLE_X, SETTINGS_TOGGLE_Y,
                    SETTINGS_TOGGLE_W, SETTINGS_TOGGLE_H)) {
             s_tap_action = (s_tap_action == TAP_ACTION_FOCUS)
                            ? TAP_ACTION_SHOOT : TAP_ACTION_FOCUS;
             settings_draw(fb);
+        } else if (ui_hit(tx, ty, SETTINGS_DIM_X, SETTINGS_DIM_Y,
+                          SETTINGS_DIM_W, SETTINGS_DIM_H)) {
+            if (s_brightness > 1) {
+                s_brightness--;
+                set_backlight(s_brightness);
+                settings_draw(fb);
+            }
+        } else if (ui_hit(tx, ty, SETTINGS_PLUS_X, SETTINGS_PLUS_Y,
+                          SETTINGS_PLUS_W, SETTINGS_PLUS_H)) {
+            if (s_brightness < 10) {
+                s_brightness++;
+                set_backlight(s_brightness);
+                settings_draw(fb);
+            }
         } else if (ui_hit(tx, ty, SETTINGS_DONE_X, SETTINGS_DONE_Y,
                           SETTINGS_DONE_W, SETTINGS_DONE_H)) {
+            nvs_handle_t h;
+            if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u8(h, "brightness", (uint8_t)s_brightness);
+                nvs_commit(h);
+                nvs_close(h);
+            }
             break;
         }
     }
@@ -2615,7 +2678,7 @@ restart:;
                 uint16_t lpx = s_long_press_x, lpy = s_long_press_y;
                 if (lpy >= PLAY_BTN_Y &&
                     ui_hit(lpx, lpy, PLAY_BTN_X, PLAY_BTN_Y, PLAY_BTN_W, PLAY_BTN_H)) {
-                    settings_menu(fb);
+                    settings_menu(fb, sock);
                     memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
                     s_ring_on_fb = false;
                 }
@@ -3268,6 +3331,17 @@ void app_main(void)
     s_http_mutex = xSemaphoreCreateMutex();
 
     display_init();
+
+    {
+        nvs_handle_t h;
+        if (nvs_open("airview", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t bval = 0;
+            if (nvs_get_u8(h, "brightness", &bval) == ESP_OK && bval >= 1 && bval <= 10)
+                s_brightness = bval;
+            nvs_close(h);
+        }
+        set_backlight(s_brightness);
+    }
 
     /* ── Setup mode: triggered by a flag written to NVS when the user tapped
        "WiFi Setup" on the connecting screen during a previous boot.  Checked
