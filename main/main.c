@@ -525,6 +525,7 @@ static esp_err_t dl_http_evt(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+
 /* GET a resource into a caller-supplied buffer. Returns byte count, 0 on error. */
 static int cam_download(const char *path, uint8_t *buf, int buf_size)
 {
@@ -554,6 +555,7 @@ static int cam_download(const char *path, uint8_t *buf, int buf_size)
     if (ctx.len > 0) buf[ctx.len] = '\0';
     return ctx.len;
 }
+
 
 /* ── Field selection tables ───────────────────────────────────────────────── */
 
@@ -1764,7 +1766,7 @@ static void draw_osd_bottom(uint16_t *fb)
     const int scale      = 2;
     const int cw         = 8 * scale;
     const int gap        = scale;
-    const int y0         = 340;
+    const int y0         = 332;
     /* Three fields: shutter (103), exprev (206), aperture (309). */
     const int centers[3]    = {115, 206, 306};
     const char *strs[3]     = {shutter_str, exprev_str, fnum_str};
@@ -2028,7 +2030,7 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         else          snprintf(iso_str, sizeof(iso_str), "%d", iso);
         int ilen = (int)strlen(iso_str);
         int iw   = ilen * (8 * 2) + (ilen > 1 ? (ilen - 1) * 2 : 0);
-        draw_osd_text(fb, 103 - iw / 2, 58, 2, iso_str, (s_selected_field == 2),
+        draw_osd_text(fb, 103 - iw / 2, 66, 2, iso_str, (s_selected_field == 2),
                       field_selectable(2, s_shoot_mode), 0);
     }
     /* OSD: white balance — top-right column (same x-centre as aperture, 309) */
@@ -2036,7 +2038,7 @@ static void decode_and_display(const uint8_t *jpeg_data, int jpeg_len, uint16_t 
         const char *wbtxt = (s_wb_cam_n > 0) ? s_wb_cam[s_wb_idx].label : "---";
         int wblen = (int)strlen(wbtxt);
         int wbw   = wblen * (8 * 2) + (wblen > 1 ? (wblen - 1) * 2 : 0);
-        draw_osd_text(fb, 309 - wbw / 2, 58, 2, wbtxt, false, (s_shoot_mode != 4), 0);
+        draw_osd_text(fb, 309 - wbw / 2, 66, 2, wbtxt, false, (s_shoot_mode != 4), 0);
     }
     /* OSD: shutter / aperture — spread at bottom */
     draw_osd_bottom(fb);
@@ -2484,14 +2486,11 @@ restart:;
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* Switch to rec mode and wait for the camera to settle.  Sending
-       changelvqty immediately after the mode switch (20 ms round-trip on
-       keep-alive) returns 520 because the camera hasn't finished the
-       internal transition yet. */
-    cam_get("/switch_cameramode.cgi?mode=rec");
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    /* Fire changelvqty + startliveview on one keep-alive connection. */
+    /* Fire mode=rec + changelvqty + startliveview on one keep-alive connection.
+       On initial boot the camera is already in rec mode so changelvqty succeeds
+       immediately.  When returning from the gallery (play mode) the camera needs
+       time to complete the internal transition; it signals this with a 520 response.
+       Retry once after a short wait rather than paying a blanket 500 ms up front. */
     {
         char lv_url[64];
         snprintf(lv_url, sizeof(lv_url),
@@ -2508,7 +2507,13 @@ restart:;
         esp_http_client_handle_t kc = esp_http_client_init(&kcfg);
         esp_http_client_set_header(kc, "User-Agent", "OlympusCameraKit");
         esp_http_client_set_header(kc, "X-Protocol",  "OlympusCameraKit");
-        cam_get_on(kc, "/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
+        cam_get_on(kc, "/switch_cameramode.cgi?mode=rec");
+        int lvq_st = cam_get_on(kc, "/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
+        if (lvq_st == 520) {
+            /* Camera still transitioning (e.g. returning from gallery). */
+            vTaskDelay(pdMS_TO_TICKS(200));
+            cam_get_on(kc, "/exec_takemisc.cgi?com=changelvqty&lvqty=0320x0240");
+        }
         cam_get_on(kc, lv_url);
         esp_http_client_cleanup(kc);
         s_http_last_us = esp_timer_get_time();
@@ -3263,8 +3268,6 @@ void app_main(void)
     s_http_mutex = xSemaphoreCreateMutex();
 
     display_init();
-    touch_init();
-    xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
 
     /* ── Setup mode: triggered by a flag written to NVS when the user tapped
        "WiFi Setup" on the connecting screen during a previous boot.  Checked
@@ -3281,16 +3284,21 @@ void app_main(void)
             nvs_close(h);
         }
         if (setup_flag) {
+            touch_init();
+            xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
             wifi_driver_init();   /* bare init for scanning, no connect */
             wifi_setup_flow();    /* scan → AP list → keyboard → save+restart */
             esp_restart();        /* reached only if user cancelled */
         }
     }
 
-    /* ── Normal boot: render connecting screen, then start WiFi.
-       The 150 ms delay lets the camera's AP finish its own boot sequence;
-       the screen render takes ~30 ms so total is safely within the 1100 ms
-       window before the first WPA2 handshake attempt. */
+    /* ── Normal boot: render the connecting screen, start WiFi, then finish
+       touch init.  wifi_begin_connecting() is non-blocking, so the 100 ms of
+       touch hardware reset delays that follow run in parallel with WiFi stack
+       init, saving ~100 ms per boot.  The 150 ms delay before connecting gives
+       the camera's AP time to come up on simultaneous power-on; without it a
+       cold boot can miss the AP, clear the channel cache, and pay a full-scan
+       retry penalty (~300–500 ms). */
     display_splash();
 
     /* If no credentials have ever been saved, skip straight to setup. */
@@ -3298,14 +3306,18 @@ void app_main(void)
         char ssid_check[33] = {0}, pass_check[65] = {0};
         wifi_creds_load(ssid_check, pass_check);
         if (!ssid_check[0]) {
+            touch_init();
+            xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
             wifi_driver_init();
             wifi_setup_flow();
             esp_restart();
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(250));
+    vTaskDelay(pdMS_TO_TICKS(150));
     wifi_begin_connecting();   /* non-blocking — STA_START fires connect */
+    touch_init();
+    xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
 
     /* ── Connecting-screen poll loop.
        WiFi handshake runs entirely in the background (lwIP / WPA2 stack tasks).
