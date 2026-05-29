@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "driver/ledc.h"
+#include "driver/gpio.h"
 #include "esp_timer.h"
 #include <stdlib.h>
 #include "freertos/semphr.h"
@@ -153,8 +154,10 @@ static void touch_task(void *arg)
 
     while (true) {
         bool     tapped = touch_poll_tap(&x, &y);
+        if (tapped) { x = (LCD_W - 1) - x; y = (LCD_H - 1) - y; }
         uint16_t cx, cy;
         bool     down   = touch_is_down(&cx, &cy);
+        if (down) { cx = (LCD_W - 1) - cx; cy = (LCD_H - 1) - cy; }
 
         if (down && !prev_down) {
             press_start = esp_timer_get_time();
@@ -1086,6 +1089,16 @@ static void af_task(void *arg)
                  req.lv_x, req.lv_y);
 
         if (s_tap_action == TAP_ACTION_SHOOT) {
+            /* Assign AF frame first so the camera fires event 101 and the
+               focus box appears before the shutter fires. */
+            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseaflock");
+            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseafframe");
+            snprintf(url, sizeof(url),
+                     "/exec_takemotion.cgi?com=newassignafframe&point=%04dx%04d",
+                     req.lv_x, req.lv_y);
+            cam_get_urgent(url);
+            cam_get_urgent("/exec_takemotion.cgi?com=newexecaflock");
+            vTaskDelay(pdMS_TO_TICKS(400));
             snprintf(url, sizeof(url),
                      "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
                      req.lv_x, req.lv_y);
@@ -1296,6 +1309,7 @@ static void display_init(void)
     ESP_ERROR_CHECK(esp_lcd_new_panel_spd2010(io_handle, &panel_cfg, &s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, true, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     ledc_timer_config_t ledc_timer = {
@@ -3322,10 +3336,32 @@ static void wifi_setup_flow(void)
     heap_caps_free(fb);
 }
 
+/* ── Power management ─────────────────────────────────────────────────────── */
+
+#define GPIO_BAT_CONTROL  7   /* drive HIGH to latch PMIC on, LOW to cut power */
+#define GPIO_CAM_PRESENT  13  /* camera 3.3V rail — goes low when camera off   */
+
+static void power_monitor_task(void *arg)
+{
+    (void)arg;
+    while (gpio_get_level(GPIO_CAM_PRESENT))
+        vTaskDelay(pdMS_TO_TICKS(200));
+    /* Camera rail dropped — cut our own power */
+    gpio_set_level(GPIO_BAT_CONTROL, 0);
+    vTaskDelete(NULL);
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────────── */
 
 void app_main(void)
 {
+    /* Latch PMIC on immediately; monitor camera 3.3V to cut power when it drops */
+    gpio_set_direction(GPIO_BAT_CONTROL, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_BAT_CONTROL, 1);
+    gpio_set_direction(GPIO_CAM_PRESENT, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(GPIO_CAM_PRESENT, GPIO_PULLDOWN_ONLY);
+    xTaskCreate(power_monitor_task, "pwr_mon", 1024, NULL, 5, NULL);
+
     ESP_ERROR_CHECK(nvs_flash_init());
 
     s_http_mutex = xSemaphoreCreateMutex();
@@ -3388,7 +3424,7 @@ void app_main(void)
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(0));
     wifi_begin_connecting();   /* non-blocking — STA_START fires connect */
     touch_init();
     xTaskCreate(touch_task, "touch", 2048, NULL, 5, NULL);
