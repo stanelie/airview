@@ -1089,16 +1089,6 @@ static void af_task(void *arg)
                  req.lv_x, req.lv_y);
 
         if (s_tap_action == TAP_ACTION_SHOOT) {
-            /* Assign AF frame first so the camera fires event 101 and the
-               focus box appears before the shutter fires. */
-            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseaflock");
-            cam_get_urgent("/exec_takemotion.cgi?com=newreleaseafframe");
-            snprintf(url, sizeof(url),
-                     "/exec_takemotion.cgi?com=newassignafframe&point=%04dx%04d",
-                     req.lv_x, req.lv_y);
-            cam_get_urgent(url);
-            cam_get_urgent("/exec_takemotion.cgi?com=newexecaflock");
-            vTaskDelay(pdMS_TO_TICKS(400));
             snprintf(url, sizeof(url),
                      "/exec_takemotion.cgi?com=newstarttake&point=%04dx%04d",
                      req.lv_x, req.lv_y);
