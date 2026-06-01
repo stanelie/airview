@@ -21,6 +21,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "driver/spi_master.h"
+#include "esp_netif.h"
 
 #include "i2c_driver.h"
 #include "tca9554.h"
@@ -264,6 +265,21 @@ static void wifi_creds_save(const char *ssid, const char *pass)
 
 /* ── WiFi ─────────────────────────────────────────────────────────────────── */
 
+static esp_netif_t *s_sta_netif = NULL;
+
+/* Apply static IP (and stop DHCP) so we skip the ~1 s DHCP exchange.
+   Called once before first connect, and again after each disconnect because
+   the netif bridge resets ip_info when the interface goes down. */
+static void apply_static_ip(void)
+{
+    esp_netif_ip_info_t ip = {};
+    ip.ip.addr      = inet_addr("192.168.0.100");
+    ip.gw.addr      = inet_addr("192.168.0.10");
+    ip.netmask.addr = inet_addr("255.255.255.0");
+    esp_netif_dhcpc_stop(s_sta_netif);   /* idempotent — ignores ALREADY_STOPPED */
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_sta_netif, &ip));
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -282,6 +298,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
                 esp_wifi_set_config(WIFI_IF_STA, &cfg);
             }
         }
+        /* The netif bridge resets ip_info when the interface goes down;
+           re-apply static IP so it's in place when the interface comes back up. */
+        apply_static_ip();
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
@@ -322,11 +341,13 @@ static void wifi_begin_connecting(void)
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     /* RAM-only storage avoids NVS flash I/O racing the EAPOL handler. */
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    /* Static IP — skip DHCP, which takes ~1 s on every boot. */
+    apply_static_ip();
 
     /* Register handlers BEFORE start so STA_START → esp_wifi_connect() fires
        without any extra round-trip through app_main. */
