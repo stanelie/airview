@@ -13,6 +13,7 @@
 #include "lwip/sockets.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
 #include "esp_timer.h"
 #include <stdlib.h>
 #include "freertos/semphr.h"
@@ -110,6 +111,9 @@ typedef enum {
 static tap_action_t s_tap_action = TAP_ACTION_FOCUS;
 
 static int s_brightness = 8;    /* 1–10; applied via LEDC backlight */
+static bool s_sound_enabled = true;
+
+static i2s_chan_handle_t s_i2s_tx = NULL;
 
 typedef struct { const char *api; const char *label; } wb_cam_t;
 static const wb_cam_t s_wb_cam[] = {
@@ -1335,6 +1339,105 @@ static void set_backlight(int level)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
+/* ── Sound (PCM5101 I2S DAC) ──────────────────────────────────────────────── */
+
+#define SOUND_BCLK  GPIO_NUM_48
+#define SOUND_LRC   GPIO_NUM_38
+#define SOUND_DOUT  GPIO_NUM_47
+
+/*
+ * Sample rate matches the Waveshare reference driver (PCM5101.c / Audio_Init).
+ * At 44100 Hz, 1 kHz square wave = 44 samples per cycle (22 high + 22 low).
+ */
+#define SOUND_SAMPLE_RATE  44100
+
+/* Silence-breaker: ±1 at 1 kHz — inaudible but keeps PCM5101A out of auto-mute.
+   At 44100 Hz, 512 frames ≈ 11.6 ms. */
+#define SB_FRAMES   512
+static int16_t s_sb_buf[SB_FRAMES * 2];
+
+/* Tick: ~1.5 ms 2 kHz square wave at 73% full scale.
+   At 44100 Hz, 66 frames ≈ 1.5 ms, 3 cycles at 2 kHz. */
+#define TICK_FRAMES 66
+static int16_t s_tick_buf[TICK_FRAMES * 2];
+
+static volatile bool   s_tick_pending = false;
+static i2s_chan_handle_t s_i2s_rx = NULL;   /* dummy RX for duplex mode */
+
+/* Single writer task — owns the I2S TX channel exclusively */
+static void sound_task(void *arg)
+{
+    (void)arg;
+    static uint32_t n = 0;
+    for (;;) {
+        size_t written;
+        if (s_sound_enabled && s_tick_pending) {
+            s_tick_pending = false;
+            i2s_channel_write(s_i2s_tx, s_tick_buf, sizeof(s_tick_buf),
+                              &written, 500);
+            ESP_LOGI("sound", "tick played (%d bytes)", (int)written);
+        } else {
+            i2s_channel_write(s_i2s_tx, s_sb_buf, sizeof(s_sb_buf),
+                              &written, 500);
+        }
+        /* log a heartbeat every ~5 s so we know the task is alive */
+        if (++n % 430 == 0)
+            ESP_LOGI("sound", "task alive, written=%d", (int)written);
+    }
+}
+
+static void sound_init(void)
+{
+    /* 1 kHz at SOUND_SAMPLE_RATE: one cycle = SOUND_SAMPLE_RATE/1000 samples */
+    const int cycle = SOUND_SAMPLE_RATE / 1000;
+    for (int i = 0; i < SB_FRAMES; i++) {
+        int16_t v = (i % cycle < cycle / 2) ? 1 : -1;
+        s_sb_buf[i * 2] = v;  s_sb_buf[i * 2 + 1] = v;
+    }
+    const int tick_cycle = SOUND_SAMPLE_RATE / 2000;   /* 2 kHz */
+    for (int i = 0; i < TICK_FRAMES; i++) {
+        int16_t v = (i % tick_cycle < tick_cycle / 2) ? 24000 : -24000;
+        s_tick_buf[i * 2] = v;  s_tick_buf[i * 2 + 1] = v;
+    }
+
+    /*
+     * Create a duplex (TX + RX) channel pair exactly as the Waveshare PCM5101.c
+     * reference does.  DIN is NC, but the duplex mode ensures the I2S master
+     * generates BCLK/WS continuously on ESP32-S3.
+     */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = false;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &s_i2s_tx, &s_i2s_rx));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SOUND_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                         I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SOUND_BCLK,
+            .ws   = SOUND_LRC,
+            .dout = SOUND_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_tx, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_i2s_rx, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_tx));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_i2s_rx));
+
+    ESP_LOGI("sound", "I2S duplex ready at %d Hz", SOUND_SAMPLE_RATE);
+    xTaskCreate(sound_task, "sound", 4096, NULL, 1, NULL);
+}
+
+/* Non-blocking: sets a flag; sound_task plays the tick on its next iteration. */
+static void tick_sound(void)
+{
+    if (s_sound_enabled && s_i2s_tx)
+        s_tick_pending = true;
+}
+
 /* ── Splash / clear screen ────────────────────────────────────────────────── */
 
 /* 8×8 bitmap font: bit N set → pixel N on (bit 0 = leftmost).
@@ -2316,6 +2419,7 @@ static bool gallery_confirm_delete(uint16_t *fb)
 
     uint16_t tx, ty;
     ui_wait_tap(&tx, &ty);
+    tick_sound();
     return ui_hit(tx, ty, bx + 142, by + 56, 90, 34);  /* YES */
 }
 
@@ -2354,6 +2458,7 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
         if (!s_tap_pending) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         s_tap_pending = false;
         uint16_t tx = s_tap_x, ty = s_tap_y;
+        tick_sound();
 
         /* Capture button — bottom centre → back to liveview */
         if (ui_hit(tx, ty, GAL_CAP_CX - GAL_CAP_R - 5, GAL_CAP_HIT_Y,
@@ -2433,20 +2538,24 @@ static void gallery_loop(uint8_t *jpeg_buf, uint16_t *fb)
 /* ── Settings menu ────────────────────────────────────────────────────────── */
 
 #define SETTINGS_TOGGLE_X   106
-#define SETTINGS_TOGGLE_Y   129
+#define SETTINGS_TOGGLE_Y   112
 #define SETTINGS_TOGGLE_W   200
 #define SETTINGS_TOGGLE_H    44
-#define SETTINGS_BRIGHT_LBL_Y  187
+#define SETTINGS_BRIGHT_LBL_Y  174
 #define SETTINGS_DIM_X      106
-#define SETTINGS_DIM_Y      199
+#define SETTINGS_DIM_Y      186
 #define SETTINGS_DIM_W       50
 #define SETTINGS_DIM_H       38
 #define SETTINGS_PLUS_X     256
-#define SETTINGS_PLUS_Y     199
+#define SETTINGS_PLUS_Y     186
 #define SETTINGS_PLUS_W      50
 #define SETTINGS_PLUS_H      38
+#define SETTINGS_SOUND_X    106
+#define SETTINGS_SOUND_Y    242
+#define SETTINGS_SOUND_W    200
+#define SETTINGS_SOUND_H     44
 #define SETTINGS_DONE_X     156
-#define SETTINGS_DONE_Y     312
+#define SETTINGS_DONE_Y     318
 #define SETTINGS_DONE_W     100
 #define SETTINGS_DONE_H      38
 
@@ -2472,6 +2581,10 @@ static void settings_draw(uint16_t *fb)
                    SETTINGS_PLUS_X - (SETTINGS_DIM_X + SETTINGS_DIM_W),
                    SETTINGS_DIM_Y + (SETTINGS_DIM_H - 16) / 2, 2, val, white);
 
+    const char *slbl = s_sound_enabled ? "SOUND: ON" : "SOUND: OFF";
+    ui_button(fb, SETTINGS_SOUND_X, SETTINGS_SOUND_Y,
+              SETTINGS_SOUND_W, SETTINGS_SOUND_H, slbl, 2, white, grey);
+
     ui_button(fb, SETTINGS_DONE_X, SETTINGS_DONE_Y,
               SETTINGS_DONE_W, SETTINGS_DONE_H, "DONE", 2, green, 0x0000);
 
@@ -2495,6 +2608,7 @@ static void settings_menu(uint16_t *fb, int lv_sock)
         s_tap_pending = false;
         tx = s_tap_x;
         ty = s_tap_y;
+        tick_sound();
         if (ui_hit(tx, ty, SETTINGS_TOGGLE_X, SETTINGS_TOGGLE_Y,
                    SETTINGS_TOGGLE_W, SETTINGS_TOGGLE_H)) {
             s_tap_action = (s_tap_action == TAP_ACTION_FOCUS)
@@ -2514,11 +2628,16 @@ static void settings_menu(uint16_t *fb, int lv_sock)
                 set_backlight(s_brightness);
                 settings_draw(fb);
             }
+        } else if (ui_hit(tx, ty, SETTINGS_SOUND_X, SETTINGS_SOUND_Y,
+                          SETTINGS_SOUND_W, SETTINGS_SOUND_H)) {
+            s_sound_enabled = !s_sound_enabled;
+            settings_draw(fb);
         } else if (ui_hit(tx, ty, SETTINGS_DONE_X, SETTINGS_DONE_Y,
                           SETTINGS_DONE_W, SETTINGS_DONE_H)) {
             nvs_handle_t h;
             if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
                 nvs_set_u8(h, "brightness", (uint8_t)s_brightness);
+                nvs_set_u8(h, "sound", s_sound_enabled ? 1 : 0);
                 nvs_commit(h);
                 nvs_close(h);
             }
@@ -2682,6 +2801,7 @@ restart:;
                 uint16_t lpx = s_long_press_x, lpy = s_long_press_y;
                 if (lpy >= PLAY_BTN_Y &&
                     ui_hit(lpx, lpy, PLAY_BTN_X, PLAY_BTN_Y, PLAY_BTN_W, PLAY_BTN_H)) {
+                    tick_sound();
                     settings_menu(fb, sock);
                     memset(fb, 0, (size_t)LCD_W * LCD_H * sizeof(uint16_t));
                     s_ring_on_fb = false;
@@ -2691,6 +2811,7 @@ restart:;
             if (s_tap_pending) {
                 s_tap_pending = false;
                 uint16_t tx = s_tap_x, ty = s_tap_y;
+                tick_sound();
                 ESP_LOGI(TAG, "tap x=%u y=%u", tx, ty);
 
                 if (ty < 50) {
@@ -3364,10 +3485,15 @@ void app_main(void)
             uint8_t bval = 0;
             if (nvs_get_u8(h, "brightness", &bval) == ESP_OK && bval >= 1 && bval <= 10)
                 s_brightness = bval;
+            uint8_t sval = 1;
+            if (nvs_get_u8(h, "sound", &sval) == ESP_OK)
+                s_sound_enabled = (sval != 0);
             nvs_close(h);
         }
         set_backlight(s_brightness);
     }
+
+    sound_init();
 
     /* ── Setup mode: triggered by a flag written to NVS when the user tapped
        "WiFi Setup" on the connecting screen during a previous boot.  Checked
