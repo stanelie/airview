@@ -215,6 +215,23 @@ static int s_selected_field = -1;   /* -1=none, 0=shutter, 1=aperture, 2=ISO, 3=
 static int64_t s_selected_field_ts = 0; /* esp_timer_get_time() of last touch while a field is selected */
 #define SELECTED_FIELD_TIMEOUT_US (3 * 1000000LL)
 
+/* Last known shoot mode / exposure settings, as camera API value strings.
+   Used to restore the camera's state both across a playback (gallery)
+   round-trip (play mode does not preserve them) and across a full power
+   cycle (loaded from NVS at boot, saved to NVS at power-off in
+   power_monitor_task). Kept current by refresh_prop() below, which runs for
+   every camera prop-changed push event — this covers settings changed via
+   the camera's own physical controls, not just touchscreen taps. */
+static char s_rest_mode[12]     = {0};
+static char s_rest_aperture[12] = {0};
+static char s_rest_shutter[12]  = {0};
+static char s_rest_iso[12]      = {0};
+static char s_rest_exprev[12]   = {0};
+static char s_rest_wb[24]       = {0}; /* WB api strings run up to "MWB_FLUORESCENCE1" (17 chars) */
+static bool s_have_restore          = false; /* true once NVS has a saved state to push at boot */
+static bool s_returning_from_gallery = false;
+static volatile bool s_restore_pending = false; /* push settings once the new stream is confirmed alive */
+
 /* ── WiFi channel cache ───────────────────────────────────────────────────── */
 
 static uint8_t channel_cache_load(void)
@@ -925,6 +942,7 @@ static void adjust_field(int field, int delta)
         s_osd.shutter_num   = s_shutter_cam[idx].num;
         s_osd.shutter_denom = s_shutter_cam[idx].denom;
         cam_set_prop_async("SHUTTER", s_shutter_cam[idx].str);
+        strlcpy(s_rest_shutter, s_shutter_cam[idx].str, sizeof(s_rest_shutter));
 
     } else if (field == 1) {
         int n = s_fnum_cam_n;
@@ -954,6 +972,7 @@ static void adjust_field(int field, int delta)
         ESP_LOGI(TAG, "focalvalue: cur_x10=%ld → %s", (long)s_osd.fnum_x10, s_fnum_cam[idx].str);
         s_osd.fnum_x10 = s_fnum_cam[idx].x10;
         cam_set_prop_async("APERTURE", s_fnum_cam[idx].str);
+        strlcpy(s_rest_aperture, s_fnum_cam[idx].str, sizeof(s_rest_aperture));
 
     } else if (field == 2) {
         int n = s_iso_cam_n;
@@ -983,6 +1002,7 @@ static void adjust_field(int field, int delta)
         ESP_LOGI(TAG, "isospeedvalue: cur=%ld → %s", (long)s_osd.iso, s_iso_cam[idx].str);
         s_osd.iso = s_iso_cam[idx].val;
         cam_set_prop_async("ISO", s_iso_cam[idx].str);
+        strlcpy(s_rest_iso, s_iso_cam[idx].str, sizeof(s_rest_iso));
 
     } else if (field == 3) {
         int n = s_exprev_cam_n;
@@ -995,6 +1015,7 @@ static void adjust_field(int field, int delta)
                  s_exprev_idx, n, s_exprev_cam[s_exprev_idx].str, s_exprev_cam[idx].str);
         s_exprev_idx = idx;
         cam_set_prop_async("EXPREV", s_exprev_cam[idx].str);
+        strlcpy(s_rest_exprev, s_exprev_cam[idx].str, sizeof(s_rest_exprev));
     }
 }
 
@@ -1061,29 +1082,38 @@ static void set_battery_str(const char *val)
 
 static void refresh_prop(const char *prop_name)
 {
-    char val[16] = {0};
+    char val[24] = {0}; /* WB api strings run up to "MWB_FLUORESCENCE1" (17 chars) */
     if (!cam_get_prop(prop_name, val, sizeof(val))) return;
 
-    if (strcmp(prop_name, "SHUTTER") == 0)
+    if (strcmp(prop_name, "SHUTTER") == 0) {
         parse_shutspeed_str(val);
-    else if (strcmp(prop_name, "APERTURE") == 0)
+        strlcpy(s_rest_shutter, val, sizeof(s_rest_shutter));
+    }
+    else if (strcmp(prop_name, "APERTURE") == 0) {
         parse_focalvalue_str(val);
-    else if (strcmp(prop_name, "ISO") == 0)
+        strlcpy(s_rest_aperture, val, sizeof(s_rest_aperture));
+    }
+    else if (strcmp(prop_name, "ISO") == 0) {
         s_osd.iso = (int32_t)atoi(val);
+        strlcpy(s_rest_iso, val, sizeof(s_rest_iso));
+    }
     else if (strcmp(prop_name, "TAKEMODE") == 0) {
         for (int i = 0; i < NUM_MODES; i++) {
             if (strcmp(val, s_mode_api[i]) == 0) { s_shoot_mode = i; break; }
         }
+        strlcpy(s_rest_mode, val, sizeof(s_rest_mode));
     }
     else if (strcmp(prop_name, "WB") == 0) {
         for (int i = 0; i < s_wb_cam_n; i++) {
             if (strcmp(val, s_wb_cam[i].api) == 0) { s_wb_idx = i; break; }
         }
+        strlcpy(s_rest_wb, val, sizeof(s_rest_wb));
     }
     else if (strcmp(prop_name, "EXPREV") == 0) {
         for (int i = 0; i < s_exprev_cam_n; i++) {
             if (strcmp(val, s_exprev_cam[i].str) == 0) { s_exprev_idx = i; break; }
         }
+        strlcpy(s_rest_exprev, val, sizeof(s_rest_exprev));
     }
     else if (strcmp(prop_name, "BATTERY_LEVEL") == 0) {
         set_battery_str(val);
@@ -1091,6 +1121,183 @@ static void refresh_prop(const char *prop_name)
 
     s_osd.valid = true;
     ESP_LOGI(TAG, "prop refreshed: %s = %s", prop_name, val);
+}
+
+/* Snapshot the camera's true current shoot mode / exposure settings into
+   s_rest_* by matching the live-tracked state (s_shoot_mode, s_wb_idx,
+   s_exprev_idx, s_osd.*) against the permitted-value lists. This is the only
+   place that captures a field the user never explicitly touched (ISO/
+   shutter/aperture/exprev are normally just displayed live from the RTP
+   stream, never written into s_rest_* on their own) — without it, only
+   fields the user happened to tap (or that the camera happened to push an
+   event for) would ever be restorable. Call this right before the live
+   state is about to become unavailable: entering the gallery, or powering
+   off. */
+static void snapshot_current_settings(void)
+{
+    strlcpy(s_rest_mode, s_mode_api[s_shoot_mode], sizeof(s_rest_mode));
+    if (s_wb_cam_n > 0)
+        strlcpy(s_rest_wb, s_wb_cam[s_wb_idx].api, sizeof(s_rest_wb));
+    if (s_exprev_cam_n > 0 && s_exprev_idx < s_exprev_cam_n)
+        strlcpy(s_rest_exprev, s_exprev_cam[s_exprev_idx].str, sizeof(s_rest_exprev));
+
+    for (int i = 0; i < s_shutter_cam_n; i++) {
+        if (s_shutter_cam[i].num == s_osd.shutter_num && s_shutter_cam[i].denom == s_osd.shutter_denom) {
+            strlcpy(s_rest_shutter, s_shutter_cam[i].str, sizeof(s_rest_shutter));
+            break;
+        }
+    }
+    for (int i = 0; i < s_fnum_cam_n; i++) {
+        if (s_fnum_cam[i].x10 == s_osd.fnum_x10) {
+            strlcpy(s_rest_aperture, s_fnum_cam[i].str, sizeof(s_rest_aperture));
+            break;
+        }
+    }
+    for (int i = 0; i < s_iso_cam_n; i++) {
+        if (s_iso_cam[i].val == s_osd.iso) {
+            strlcpy(s_rest_iso, s_iso_cam[i].str, sizeof(s_rest_iso));
+            break;
+        }
+    }
+}
+
+/* Push the last known shoot mode / exposure settings (s_rest_*) to the
+   camera — used to restore state after a gallery round-trip or a power
+   cycle, since the camera does not retain them on its own. Skips any field
+   that was never captured (e.g. a fresh device with nothing saved yet).
+   Must only be called once the liveview stream is confirmed flowing again
+   (see s_restore_pending) — issuing these right after switch_cameramode +
+   startliveview, before any frame has arrived, was found to leave the
+   stream stuck (camera's HTTP/video pipeline is briefly fragile right after
+   its own mode transition). Runs in its own task (see restore_settings_task)
+   so the liveview receive loop is never blocked by it either. */
+static void push_saved_settings_to_camera(void)
+{
+    /* Snapshot the target values locally, immediately, before anything else.
+       The camera transiently reverts several properties by itself while
+       settling into its post-standalone state (TAKEMODE to iA, and — since
+       iA forces auto white balance — WB to WB_AUTO too), and that transient
+       state arrives back to us as ordinary push events. Those events run
+       refresh_prop() same as any other prop change, which keeps s_rest_*
+       "live" — exactly right for the power-off NVS snapshot, but wrong here:
+       reading s_rest_* again after the multi-second mode-settle delay below
+       could pick up that transient reset instead of what we actually want to
+       restore. A local copy taken up front is immune to this. */
+    char tgt_mode[12], tgt_aperture[12], tgt_shutter[12];
+    char tgt_iso[12], tgt_exprev[12], tgt_wb[24];
+    strlcpy(tgt_mode,     s_rest_mode,     sizeof(tgt_mode));
+    strlcpy(tgt_aperture, s_rest_aperture, sizeof(tgt_aperture));
+    strlcpy(tgt_shutter,  s_rest_shutter,  sizeof(tgt_shutter));
+    strlcpy(tgt_iso,      s_rest_iso,      sizeof(tgt_iso));
+    strlcpy(tgt_exprev,   s_rest_exprev,   sizeof(tgt_exprev));
+    strlcpy(tgt_wb,       s_rest_wb,       sizeof(tgt_wb));
+
+    /* Timing logged via esp_timer_get_time (µs monotonic) rather than assumed —
+       measured on real hardware: TAKEMODE confirms ~350-400ms after the set is
+       fired, ~900ms total including the baseline wait below. The baseline and
+       poll ceiling here are tuned from that data, not guessed. */
+    int64_t t_restore_start = esp_timer_get_time();
+    ESP_LOGI(TAG, "RESTORE_TIMING begin target_mode=%s", tgt_mode[0] ? tgt_mode : "-");
+
+    /* Give the camera's HTTP/property subsystem a moment even when the mode
+       itself doesn't need changing — it only just started this stream. */
+    vTaskDelay(pdMS_TO_TICKS(300));
+    ESP_LOGI(TAG, "RESTORE_TIMING baseline_wait_done +%lld ms",
+             (long long)((esp_timer_get_time() - t_restore_start) / 1000));
+
+    /* true once we know the camera is actually in the mode we want — either
+       it already was, or we changed it and confirmed the change stuck. */
+    bool mode_ok = true;
+    char cur_mode[12] = {0};
+    bool got_cur = cam_get_prop("TAKEMODE", cur_mode, sizeof(cur_mode));
+    ESP_LOGI(TAG, "RESTORE_TIMING initial_takemode_read +%lld ms result=%s",
+             (long long)((esp_timer_get_time() - t_restore_start) / 1000),
+             got_cur ? cur_mode : "FAIL");
+    if (tgt_mode[0] && got_cur && strcmp(cur_mode, tgt_mode) != 0) {
+        mode_ok = false;
+        int64_t t_set = esp_timer_get_time();
+        cam_set_prop_async("TAKEMODE", tgt_mode);
+        ESP_LOGI(TAG, "RESTORE_TIMING takemode_set_fired +%lld ms (camera=%s want=%s)",
+                 (long long)((t_set - t_restore_start) / 1000), cur_mode, tgt_mode);
+
+        /* Poll rapidly and stop the instant it's confirmed, instead of a fixed
+           sleep — as fast as the camera allows. Measured on real hardware at
+           ~350-400ms consistently; the 3s ceiling is just a safety net for an
+           occasional slow/failed response, ~7-8x the observed worst case. */
+        const int64_t poll_ceiling_us = 3000000LL;
+        while (!mode_ok && (esp_timer_get_time() - t_set) < poll_ceiling_us) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            bool ok = cam_get_prop("TAKEMODE", cur_mode, sizeof(cur_mode));
+            int64_t elapsed_ms = (esp_timer_get_time() - t_set) / 1000;
+            ESP_LOGI(TAG, "RESTORE_TIMING poll_takemode +%lld ms since_set result=%s",
+                     (long long)elapsed_ms, ok ? cur_mode : "FAIL");
+            if (ok && strcmp(cur_mode, tgt_mode) == 0) {
+                mode_ok = true;
+                ESP_LOGI(TAG, "RESTORE_TIMING takemode_confirmed after %lld ms since_set",
+                         (long long)elapsed_ms);
+            }
+        }
+        if (!mode_ok)
+            ESP_LOGW(TAG, "RESTORE_TIMING takemode_TIMEOUT after %lld ms since_set, camera stuck at %s",
+                     (long long)(poll_ceiling_us / 1000), cur_mode);
+
+        /* Reflect whatever the camera actually ended up in, not just what we
+           asked for — a set can silently fail right after a mode transition,
+           e.g. the camera reverting to iA instead. */
+        for (int i = 0; i < NUM_MODES; i++)
+            if (strcmp(cur_mode, s_mode_api[i]) == 0) { s_shoot_mode = i; break; }
+    } else {
+        ESP_LOGI(TAG, "RESTORE_TIMING takemode_already_correct +%lld ms",
+                 (long long)((esp_timer_get_time() - t_restore_start) / 1000));
+    }
+
+    /* Manual exposure fields are meaningless — and the camera rejects them —
+       in iA, or in general whenever the mode restore itself didn't take. Only
+       push them once the camera is confirmed to be in the mode that makes
+       them valid, so we don't display settings that were silently ignored. */
+    if (mode_ok) {
+        if (tgt_aperture[0]) cam_set_prop_async("APERTURE", tgt_aperture);
+        if (tgt_shutter[0])  cam_set_prop_async("SHUTTER",  tgt_shutter);
+        if (tgt_iso[0])      cam_set_prop_async("ISO",      tgt_iso);
+        if (tgt_exprev[0]) {
+            cam_set_prop_async("EXPREV", tgt_exprev);
+            for (int i = 0; i < s_exprev_cam_n; i++)
+                if (strcmp(tgt_exprev, s_exprev_cam[i].str) == 0) { s_exprev_idx = i; break; }
+        }
+        if (tgt_wb[0]) {
+            cam_set_prop_async("WB", tgt_wb);
+            /* No self-correcting update via RTP for WB, unlike the other
+               exposure fields — set it locally now rather than racing a
+               read-back against the async set above, which could latch onto
+               the pre-restore value. */
+            for (int i = 0; i < s_wb_cam_n; i++)
+                if (strcmp(tgt_wb, s_wb_cam[i].api) == 0) { s_wb_idx = i; break; }
+        }
+
+        /* Re-affirm what we just pushed into s_rest_* — an intervening push
+           event during the delays above may have overwritten it with the
+           camera's transient reset state, and that would otherwise persist
+           into the next NVS-at-shutdown save. */
+        strlcpy(s_rest_aperture, tgt_aperture, sizeof(s_rest_aperture));
+        strlcpy(s_rest_shutter,  tgt_shutter,  sizeof(s_rest_shutter));
+        strlcpy(s_rest_iso,      tgt_iso,      sizeof(s_rest_iso));
+        strlcpy(s_rest_exprev,   tgt_exprev,   sizeof(s_rest_exprev));
+        strlcpy(s_rest_wb,       tgt_wb,       sizeof(s_rest_wb));
+    }
+    strlcpy(s_rest_mode, cur_mode[0] ? cur_mode : tgt_mode, sizeof(s_rest_mode));
+
+    if (s_selected_field >= 0 && !field_selectable(s_selected_field, s_shoot_mode))
+        s_selected_field = -1;
+
+    ESP_LOGI(TAG, "RESTORE_TIMING done total=%lld ms mode_ok=%d",
+             (long long)((esp_timer_get_time() - t_restore_start) / 1000), (int)mode_ok);
+}
+
+static void restore_settings_task(void *arg)
+{
+    (void)arg;
+    push_saved_settings_to_camera();
+    vTaskDelete(NULL);
 }
 
 static void battery_task(void *arg)
@@ -1142,14 +1349,9 @@ static void init_props_task(void *arg)
     if (cam_get_prop("BATTERY_LEVEL", batt_val, sizeof(batt_val)))
         set_battery_str(batt_val);
 
-    /* Read actual shoot mode so field_selectable() works correctly from boot. */
-    char mode_val[12] = {0};
-    if (cam_get_prop("TAKEMODE", mode_val, sizeof(mode_val))) {
-        for (int i = 0; i < NUM_MODES; i++) {
-            if (strcmp(mode_val, s_mode_api[i]) == 0) { s_shoot_mode = i; break; }
-        }
-        ESP_LOGI(TAG, "TAKEMODE: %s → mode %d", mode_val, s_shoot_mode);
-    }
+    /* Read actual shoot mode so field_selectable() works correctly from boot;
+       refresh_prop also seeds s_rest_mode for the settings-restore feature. */
+    refresh_prop("TAKEMODE");
 
     build_prop_lists();
 
@@ -2661,6 +2863,7 @@ static void settings_menu(uint16_t *fb, int lv_sock)
             if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
                 nvs_set_u8(h, "brightness", (uint8_t)s_brightness);
                 nvs_set_u8(h, "sound", s_sound_enabled ? 1 : 0);
+                nvs_set_u8(h, "tap_action", s_tap_action == TAP_ACTION_SHOOT ? 1 : 0);
                 nvs_commit(h);
                 nvs_close(h);
             }
@@ -2732,6 +2935,27 @@ restart:;
     /* Start pushevent task here, after switch_cameramode + startliveview, so the
        camera's event channel is not torn down by a subsequent mode switch. */
     static bool s_pushevent_started = false;
+    bool first_liveview_start = !s_pushevent_started;
+
+    /* Restore shoot mode / exposure settings to what they were before: either
+       we're returning from the gallery (play mode does not preserve them),
+       or this is the first liveview start after a power cycle and NVS has a
+       state saved from before the camera was last turned off. Otherwise
+       (a genuinely fresh device, nothing to restore yet) just read whatever
+       the camera is currently set to, as before. The actual restore push is
+       deferred until the stream is confirmed alive (see s_restore_pending
+       below) rather than done here, since the camera's HTTP/video pipeline
+       is briefly fragile right after its own mode transition. */
+    if (s_returning_from_gallery || (first_liveview_start && s_have_restore)) {
+        s_returning_from_gallery = false;
+        s_restore_pending = true;
+    } else {
+        refresh_prop("TAKEMODE");
+        refresh_prop("WB");
+        if (s_selected_field >= 0 && !field_selectable(s_selected_field, s_shoot_mode))
+            s_selected_field = -1;
+    }
+
     if (!s_pushevent_started) {
         s_pushevent_started = true;
         s_prop_queue = xQueueCreate(8, PROP_NAME_MAX);
@@ -2842,6 +3066,7 @@ restart:;
                     s_shoot_mode = (s_shoot_mode + 1) % NUM_MODES;
                     ESP_LOGI(TAG, "shoot mode → %s", s_mode_display[s_shoot_mode]);
                     cam_set_prop_async("TAKEMODE", s_mode_api[s_shoot_mode]);
+                    strlcpy(s_rest_mode, s_mode_api[s_shoot_mode], sizeof(s_rest_mode));
                     /* Do NOT call build_prop_lists() here: the camera's HTTP server
                        goes offline for several seconds after a mode change, and
                        the value lists loaded at startup remain valid across modes. */
@@ -2862,6 +3087,7 @@ restart:;
                         ESP_LOGI(TAG, "WB → %s (%s)", s_wb_cam[s_wb_idx].label,
                                  s_wb_cam[s_wb_idx].api);
                         cam_set_prop_async("WB", s_wb_cam[s_wb_idx].api);
+                        strlcpy(s_rest_wb, s_wb_cam[s_wb_idx].api, sizeof(s_rest_wb));
                     }
                 } else if (ty >= PLAY_BTN_Y &&
                            ui_hit(tx, ty, PLAY_BTN_X, PLAY_BTN_Y,
@@ -2903,6 +3129,7 @@ restart:;
             }
 
             if (want_gallery) {
+                snapshot_current_settings();
                 gallery_show_message(fb, "Loading...");
                 cam_get("/exec_takemisc.cgi?com=stopliveview");
                 close(sock);
@@ -2913,12 +3140,20 @@ restart:;
                    the camera can't start liveview from play mode — changelvqty returns
                    520 even with a 500ms delay after switch rec.  Going via standalone
                    first gives the camera a clean base; standalone → rec works. */
+                ESP_LOGI(TAG, "RESTORE_TIMING gallery_exit_standalone_switch_sent");
                 cam_get("/switch_cameramode.cgi?mode=standalone");
+                s_returning_from_gallery = true;
                 goto restart;
             }
             decode_and_display(jpeg_buf, jpeg_off, fb);
             frames++;
             fps_frames++;
+
+            if (s_restore_pending && frames == 1) {
+                ESP_LOGI(TAG, "RESTORE_TIMING first_frame_received, spawning restore task");
+                s_restore_pending = false;
+                xTaskCreate(restore_settings_task, "restore_set", 4096, NULL, 3, NULL);
+            }
 
             /* Log FPS every 5 s */
             {
@@ -3479,6 +3714,63 @@ static void wifi_setup_flow(void)
     heap_caps_free(fb);
 }
 
+/* ── Serial debug console ─────────────────────────────────────────────────────
+   Talk to the camera directly over the USB serial console, to see exactly
+   what it returns rather than guessing. Every line of output is prefixed
+   "DBG> " so it's easy to grep out of the regular ESP_LOG noise on the same
+   console. Commands:
+     get <path>         raw HTTP GET, e.g. get /get_camprop.cgi?com=get&propname=TAKEMODE
+     set <PROP> <value> set_camprop.cgi via cam_set_prop (synchronous)
+     prop <PROP>        get_camprop.cgi?com=get via cam_get_prop
+     status              dump current in-RAM shoot mode / exposure state
+   ────────────────────────────────────────────────────────────────────────── */
+
+static void debug_console_task(void *arg)
+{
+    (void)arg;
+    char line[256];
+
+    for (;;) {
+        if (!fgets(line, sizeof(line), stdin)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        if (n == 0) continue;
+
+        char *cmd = strtok(line, " ");
+        if (!cmd) continue;
+
+        if (strcmp(cmd, "get") == 0) {
+            char *path = strtok(NULL, "");
+            if (!path) { printf("DBG> usage: get <path>\n"); continue; }
+            xSemaphoreTake(s_http_mutex, portMAX_DELAY);
+            int st = cam_get_impl(path);
+            printf("DBG> GET %s -> %d\nDBG> body: %s\n", path, st, s_resp);
+            xSemaphoreGive(s_http_mutex);
+        } else if (strcmp(cmd, "set") == 0) {
+            char *name = strtok(NULL, " ");
+            char *val  = strtok(NULL, "");
+            if (!name || !val) { printf("DBG> usage: set <PROP> <value>\n"); continue; }
+            bool ok = cam_set_prop(name, val);
+            printf("DBG> SET %s=%s -> %s\n", name, val, ok ? "ok" : "fail");
+        } else if (strcmp(cmd, "prop") == 0) {
+            char *name = strtok(NULL, " ");
+            if (!name) { printf("DBG> usage: prop <PROP>\n"); continue; }
+            char val[32] = {0};
+            bool ok = cam_get_prop(name, val, sizeof(val));
+            printf("DBG> PROP %s -> %s (%s)\n", name, ok ? val : "?", ok ? "ok" : "fail");
+        } else if (strcmp(cmd, "status") == 0) {
+            printf("DBG> shoot_mode=%d wb_idx=%d exprev_idx=%d iso=%ld fnum_x10=%ld shutter=%ld/%ld sel_field=%d\n",
+                   s_shoot_mode, s_wb_idx, s_exprev_idx, (long)s_osd.iso, (long)s_osd.fnum_x10,
+                   (long)s_osd.shutter_num, (long)s_osd.shutter_denom, s_selected_field);
+        } else {
+            printf("DBG> unknown cmd '%s' (get/set/prop/status)\n", cmd);
+        }
+    }
+}
+
 /* ── Power management ─────────────────────────────────────────────────────── */
 
 #define GPIO_BAT_CONTROL  7   /* drive HIGH to latch PMIC on, LOW to cut power */
@@ -3489,7 +3781,24 @@ static void power_monitor_task(void *arg)
     (void)arg;
     while (gpio_get_level(GPIO_CAM_PRESENT))
         vTaskDelay(pdMS_TO_TICKS(200));
-    /* Camera rail dropped — cut our own power */
+
+    /* Camera rail dropped — save the last known shoot mode / exposure
+       settings so they can be restored on the next boot (the camera itself
+       does not retain them across a power cycle), then cut our own power.
+       Written here rather than on every adjustment to avoid wearing NVS. */
+    snapshot_current_settings();
+    nvs_handle_t h;
+    if (nvs_open("airview", NVS_READWRITE, &h) == ESP_OK) {
+        if (s_rest_mode[0])     nvs_set_str(h, "m_mode", s_rest_mode);
+        if (s_rest_aperture[0]) nvs_set_str(h, "m_ap",   s_rest_aperture);
+        if (s_rest_shutter[0])  nvs_set_str(h, "m_sh",   s_rest_shutter);
+        if (s_rest_iso[0])      nvs_set_str(h, "m_iso",  s_rest_iso);
+        if (s_rest_exprev[0])   nvs_set_str(h, "m_ev",   s_rest_exprev);
+        if (s_rest_wb[0])       nvs_set_str(h, "m_wb",   s_rest_wb);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
     gpio_set_level(GPIO_BAT_CONTROL, 0);
     vTaskDelete(NULL);
 }
@@ -3508,6 +3817,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
 
     s_http_mutex = xSemaphoreCreateMutex();
+    xTaskCreate(debug_console_task, "dbg_console", 4096, NULL, 2, NULL);
 
     display_init();
 
@@ -3520,6 +3830,19 @@ void app_main(void)
             uint8_t sval = 1;
             if (nvs_get_u8(h, "sound", &sval) == ESP_OK)
                 s_sound_enabled = (sval != 0);
+            uint8_t tval = 0;
+            if (nvs_get_u8(h, "tap_action", &tval) == ESP_OK)
+                s_tap_action = tval ? TAP_ACTION_SHOOT : TAP_ACTION_FOCUS;
+
+            size_t len;
+            len = sizeof(s_rest_mode);     nvs_get_str(h, "m_mode", s_rest_mode,     &len);
+            len = sizeof(s_rest_aperture); nvs_get_str(h, "m_ap",   s_rest_aperture, &len);
+            len = sizeof(s_rest_shutter);  nvs_get_str(h, "m_sh",   s_rest_shutter,  &len);
+            len = sizeof(s_rest_iso);      nvs_get_str(h, "m_iso",  s_rest_iso,      &len);
+            len = sizeof(s_rest_exprev);   nvs_get_str(h, "m_ev",   s_rest_exprev,   &len);
+            len = sizeof(s_rest_wb);       nvs_get_str(h, "m_wb",   s_rest_wb,       &len);
+            s_have_restore = (s_rest_mode[0] != '\0');
+
             nvs_close(h);
         }
         set_backlight(s_brightness);
