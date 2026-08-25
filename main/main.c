@@ -212,6 +212,8 @@ static QueueHandle_t s_prop_queue = NULL;
 
 
 static int s_selected_field = -1;   /* -1=none, 0=shutter, 1=aperture, 2=ISO, 3=exprev */
+static int64_t s_selected_field_ts = 0; /* esp_timer_get_time() of last touch while a field is selected */
+#define SELECTED_FIELD_TIMEOUT_US (3 * 1000000LL)
 
 /* ── WiFi channel cache ───────────────────────────────────────────────────── */
 
@@ -2850,6 +2852,7 @@ restart:;
                     /* ISO — top-left column (text y=58–74; zone 50–89, +one row below text) */
                     if (field_selectable(2, s_shoot_mode)) {
                         s_selected_field = (s_selected_field == 2) ? -1 : 2;
+                        s_selected_field_ts = esp_timer_get_time();
                         ESP_LOGI(TAG, "selected field %d", s_selected_field);
                     }
                 } else if (ty < 90) {
@@ -2873,6 +2876,7 @@ restart:;
                     else                          field = 1; /* aperture */
                     if (field_selectable(field, s_shoot_mode)) {
                         s_selected_field = (s_selected_field == field) ? -1 : field;
+                        s_selected_field_ts = esp_timer_get_time();
                         ESP_LOGI(TAG, "selected field %d", s_selected_field);
                     }
                 } else if (s_selected_field >= 0) {
@@ -2880,6 +2884,7 @@ restart:;
                     int delta = (tx >= (LCD_W / 2)) ? +1 : -1;
                     ESP_LOGI(TAG, "adjust field %d delta %d", s_selected_field, delta);
                     adjust_field(s_selected_field, delta);
+                    s_selected_field_ts = esp_timer_get_time();
                 } else {
                     /* Tap on main image: queue touch AF — the af_task handles
                        the HTTP calls so the liveview loop keeps running. */
@@ -2891,6 +2896,12 @@ restart:;
                     }
                 }
             }
+            if (s_selected_field >= 0 &&
+                (esp_timer_get_time() - s_selected_field_ts) > SELECTED_FIELD_TIMEOUT_US) {
+                ESP_LOGI(TAG, "field %d deselected after idle timeout", s_selected_field);
+                s_selected_field = -1;
+            }
+
             if (want_gallery) {
                 gallery_show_message(fb, "Loading...");
                 cam_get("/exec_takemisc.cgi?com=stopliveview");
