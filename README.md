@@ -51,16 +51,22 @@ To change credentials later, tap **Wi-Fi Setup** on the connecting screen.
 ## Partitions
 
 ```
-nvs       0x009000  24 KB   app data (credentials, channel cache)
+nvs       0x009000  24 KB   app data (credentials, channel cache, restore state)
 phy_init  0x00f000   4 KB   RF calibration
-factory   0x010000   1 MB   application
+factory   0x010000   4 MB   application
 ```
+
+Custom table (`partitions.csv`), 16 MB flash total — `CONFIG_PARTITION_TABLE_CUSTOM` must be `y` in `sdkconfig`/`sdkconfig.defaults` or the build silently falls back to IDF's built-in 1 MB single-app table instead. ~12 MB of flash beyond the app partition is currently unpartitioned.
 
 If the device shows a `phy_init: saving new calibration data because of checksum failure` warning on every boot (adds ~2.4 s to connect time), erase the RF calibration partition once:
 
 ```bash
 esptool.py --port /dev/ttyACM0 --chip esp32s3 erase_region 0xf000 0x1000
 ```
+
+## Camera protocol notes
+
+Empirically-discovered Olympus Air A01 behavior not covered (or not accurate) in `OPC_Communication_Protocol_EN_1.0a.pdf` — measured timings, property reset quirks, etc. — is kept in [`CAMERA_NOTES.md`](CAMERA_NOTES.md) so it isn't lost between debugging sessions.
 
 ## Project structure
 
